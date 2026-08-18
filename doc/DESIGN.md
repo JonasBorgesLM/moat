@@ -409,6 +409,47 @@ edited to read as if `moat` had been the plan all along, because a design
 record that quietly rewrites its own history is worth less than one that shows
 its work.
 
+### 6.11 Pre-release hardening: rename verified, ordering gap closed, self-found bugs audited
+
+Four passes ran between initial implementation and the first tag, each closing
+something an earlier pass had only asserted, deferred, or accepted as a
+trade-off:
+
+- The module was renamed from `gosecure` to `moat` once the pkg.go.dev
+  crowding §6.10 flagged as a risk was actually confirmed (§10.10). Every
+  import path, protocol-level default (the CSRF cookie and field names, the
+  Redis key prefix), and reference in this document was updated to match;
+  nothing under the old name was ever pushed to the remote.
+- `preset.API`'s middleware order was changed so `secureheaders` runs
+  outermost, ahead of rate limiting, closing the gap where a `429` shipped
+  with no CSP or `nosniff` (§10.6). That gap was originally documented and
+  accepted as a trade-off; it was reconsidered and reversed rather than
+  shipped that way.
+- The Redis integration suite (`redisstore`, build tag `integration`) was run
+  for real against a live container, not merely compiled. Its atomicity claim
+  was verified two ways: the concurrency test now asserts an exact admitted
+  count against a single-digit-capacity bucket under heavy contention, and —
+  as a check on the test itself — the atomic Lua path was temporarily
+  replaced with a naive two-round-trip read-then-write, which the test caught
+  immediately (200 of 200 requests admitted against a capacity of 8, in a
+  test that asserts exactly 8). The naive path was never committed.
+- The two bugs self-found during initial implementation (§10.2's idle-eviction
+  floor, and a timeout-less `http.ListenAndServe` in a `redisstore` doc
+  example) were each verified round-trip: the pre-fix code was temporarily
+  reintroduced, the regression test — or, for the timeout case, the `gosec`
+  CI gate, since a compile-only doc example has no runtime assertion to make
+  about timeouts — was confirmed to fail, and the fix was restored. The
+  codebase was then swept for the same shape of each bug elsewhere: no other
+  TTL-evicting store exists in the tree, and every other `http.Server` in
+  `examples/` was checked and brought to a consistent timeout configuration.
+  Both bug classes are now standing items in `CONTRIBUTING.md`'s review
+  checklist, since neither has a fuzz target and both are easy to
+  reintroduce by copy-paste without a reviewer having seen the original
+  finding.
+
+`v0.1.0` was tagged on the commit that closes this section, not on any earlier
+one — see §8.
+
 ---
 
 ## 7. Testing strategy
@@ -442,6 +483,14 @@ CI runs, per module: `go vet`, `staticcheck`, `gosec`, `go build`,
 - Post-v1, the exported API follows the Go compatibility promise; breaking
   changes require a new major version and module path suffix.
 - Each module is tagged independently (`v0.3.0`, `redisstore/v0.3.0`).
+- **`v0.1.0` (core) and `redisstore/v0.1.0` were tagged on the commit that
+  closes §6.11** — after the rename to `moat`, after the `preset.API`
+  ordering fix, and after both self-found bugs were verified and swept for
+  recurrence — not on the commit that first implemented the library, and not
+  on the commit that introduced the rename or the reorder in isolation. The
+  tag marks the state that was actually verified end-to-end: renamed,
+  reordered, and audited, with the full verification table re-run under the
+  final module name rather than carried forward from an earlier pass.
 
 ---
 
