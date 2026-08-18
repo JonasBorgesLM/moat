@@ -7,7 +7,7 @@
 //
 // Run it:
 //
-//	CSRF_SECRET=$(go run github.com/JonasBorgesLM/gosecure/cmd/gosecure-secret) \
+//	CSRF_SECRET=$(go run github.com/JonasBorgesLM/moat/cmd/moat-secret) \
 //	  go run ./basic
 package main
 
@@ -22,13 +22,13 @@ import (
 	"os"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
-	"github.com/JonasBorgesLM/gosecure/middleware"
-	"github.com/JonasBorgesLM/gosecure/pathguard"
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
-	"github.com/JonasBorgesLM/gosecure/sanitize"
-	"github.com/JonasBorgesLM/gosecure/secureheaders"
-	"github.com/JonasBorgesLM/gosecure/validate"
+	"github.com/JonasBorgesLM/moat/csrf"
+	"github.com/JonasBorgesLM/moat/middleware"
+	"github.com/JonasBorgesLM/moat/pathguard"
+	"github.com/JonasBorgesLM/moat/ratelimit"
+	"github.com/JonasBorgesLM/moat/sanitize"
+	"github.com/JonasBorgesLM/moat/secureheaders"
+	"github.com/JonasBorgesLM/moat/validate"
 )
 
 func main() {
@@ -68,7 +68,7 @@ func main() {
 func loadSecret() ([]byte, error) {
 	raw := os.Getenv("CSRF_SECRET")
 	if raw == "" {
-		return nil, errors.New("CSRF_SECRET is not set; generate one with `go run github.com/JonasBorgesLM/gosecure/cmd/gosecure-secret`")
+		return nil, errors.New("CSRF_SECRET is not set; generate one with `go run github.com/JonasBorgesLM/moat/cmd/moat-secret`")
 	}
 	secret, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {

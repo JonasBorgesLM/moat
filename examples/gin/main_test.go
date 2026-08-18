@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
+	"github.com/JonasBorgesLM/moat/csrf"
 )
 
 const host = "app.example.com"

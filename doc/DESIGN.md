@@ -42,8 +42,8 @@ disagreed with the plan.
 Two Go modules, versioned independently:
 
 ```
-github.com/JonasBorgesLM/gosecure/
-├── go.mod                      module github.com/JonasBorgesLM/gosecure   (stdlib only)
+github.com/JonasBorgesLM/moat/
+├── go.mod                      module github.com/JonasBorgesLM/moat   (stdlib only)
 │   ├── doc.go                  package docs only, no code
 │   ├── middleware/             Chain — zero sibling imports
 │   ├── ratelimit/              token bucket + Store interface
@@ -55,10 +55,10 @@ github.com/JonasBorgesLM/gosecure/
 │   └── preset/                 helmet-style bundles (imports siblings)
 │
 ├── redisstore/
-│   └── go.mod                  module .../gosecure/redisstore  (+ go-redis, testcontainers)
+│   └── go.mod                  module .../moat/redisstore  (+ go-redis, testcontainers)
 │
 ├── examples/
-│   └── go.mod                  module .../gosecure/examples    (+ gin, echo)
+│   └── go.mod                  module .../moat/examples    (+ gin, echo)
 │
 └── go.work                     local development only, not committed to tags
 ```
@@ -377,10 +377,19 @@ risk — inappropriate for a security library. All tooling is version-pinned.
 
 ### 6.10 Module path naming
 
-`gosecure` is a crowded name in the Go ecosystem, and the community style guide
-discourages `go`-prefixed package names. **Verify availability on pkg.go.dev
-before the first tag**, since the module path is baked into every consumer's
-import and is painful to change afterwards.
+The working name during design and initial implementation was `gosecure`. The
+Go community style guide discourages `go`-prefixed package names for good
+reason — the prefix says nothing about what the package does — and a
+pre-implementation review flagged it as a name to verify before the first tag,
+since the module path is baked into every consumer's import and is painful to
+change afterwards.
+
+That verification happened, found the name was in fact crowded, and the module
+was renamed to `moat` as a result. §10.10 has the search results and the
+reasoning for the replacement name; this section is left in place, rather than
+edited to read as if `moat` had been the plan all along, because a design
+record that quietly rewrites its own history is worth less than one that shows
+its work.
 
 ---
 
@@ -539,20 +548,49 @@ rather than truncating to 0.
 
 `redisstore` and `examples` require the core at `v0.1.0`, which does not resolve
 until that tag is pushed. `go.work` therefore carries
-`replace github.com/JonasBorgesLM/gosecure v0.1.0 => ./`, which can be dropped
+`replace github.com/JonasBorgesLM/moat v0.1.0 => ./`, which can be dropped
 once the tag exists. It lives in the workspace rather than in a module's
 `go.mod` because a `replace` in a published `go.mod` is ignored by consumers and
 only misleads them. CI recreates the workspace, since `go.work` is not
 committed.
 
-### 10.10 The name is as crowded as §6.10 feared
+### 10.10 The name was `gosecure`, verified crowded, and replaced with `moat`
 
-A pkg.go.dev search for `gosecure` returns at least fourteen distinct modules
-using that name, none of them related to this one. The module *path*
-`github.com/JonasBorgesLM/gosecure` is unclaimed and works, since the path is
-namespaced by account. What is crowded is the package name people will type and
-search for.
+§6.10 asked for pkg.go.dev availability to be checked before the first tag.
+That check happened against the original working name, `gosecure`, and the
+result was unfavorable: at least fourteen distinct modules on pkg.go.dev
+already use that name, unrelated to this project and to each other, and the
+Go style guide separately discourages a `go`-prefixed package name regardless.
+The module *path* was never at risk — `github.com/JonasBorgesLM/gosecure`
+was unclaimed and namespaced by account like any other — but the package name
+people type, import, and search for was not distinctive, and renaming after a
+tagged release is expensive in a way that renaming before one is not.
 
-§6.10 asked for this to be verified before the first tag. It has been, and the
-answer is unfavorable. Renaming is cheap now and expensive after v0.1.0, since
-the module path is baked into every consumer's import.
+Eight replacement candidates were checked the same way, against both
+pkg.go.dev and a GitHub repository-name search, before picking one:
+
+| Candidate | Verdict |
+|---|---|
+| `httpguard` | Rejected — `Laisky/go-httpguard`, an existing Go HTTP-protection/rate-limiting library. Same problem space. |
+| `gatekeeper` | Rejected — dominated by OPA/Kubernetes Gatekeeper, extremely well known in Go cloud-native tooling. |
+| `bastion` | Rejected — `ifreddyrondon/bastion` is an existing Go HTTP web framework with its own middleware. |
+| `aegis` | Rejected — collides with a real AEAD cipher (`ericlagergren/aegis`, `philhofer/aegis`); misleading for a library with no encryption primitive of its own. |
+| `parapet` | Rejected — `moonrhythm/parapet` is an actively maintained Go HTTP middleware/WAF library. Direct collision. |
+| `rampart` | Rejected — `manimovassagh/rampart` provides JWT verification middleware for Go HTTP servers. Direct collision. |
+| `warden` | Rejected — heavily used already for authorization frameworks and container engines; a Ruby-Warden middleware clone exists too. Crowded, generic. |
+| `bulwark`, `redoubt`, `palisade`, `moat` | Clean or near-clean: no Go/HTTP-middleware collision on pkg.go.dev for any of the four. `bulwark` and `palisade` each carry a moderately known unrelated project in the broader security space (a cryptocurrency project and a vulnerability-management tool for the former; GCHQ's data-access-policy tool for the latter). `redoubt` and `moat` had the cleanest results of all eight candidates. |
+
+`moat` was chosen from that final group: shortest, reads as a natural Go
+identifier (`moat.New`, `moat.Chain`, `moat.API`), and is an apt metaphor for
+what the library does — a moat is a protective barrier around what it
+defends, the same role this library's middleware plays around an
+`http.Handler`. Its one soft collision, `laravel/moat` (a GitHub-organization
+security-posture scanner), is a different language and a different kind of
+tool, unlikely to be confused with a Go HTTP-middleware import.
+
+The rename touched every module path, the package declaration, the protocol-
+level CSRF cookie and field name defaults (`gosecure.csrf` →
+`moat.csrf`, `__Host-gosecure.csrf` → `__Host-moat.csrf`), the Redis key
+prefix, and the `cmd/gosecure-secret` binary (renamed to `cmd/moat-secret`).
+It was done before the first tag specifically so that none of those were ever
+part of a released, importable API.

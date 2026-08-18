@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
+	"github.com/JonasBorgesLM/moat/csrf"
 )
 
 const testHost = "app.example.com"
@@ -89,7 +89,7 @@ func post(t *testing.T, p *csrf.Protector, o postOpts) *httptest.ResponseRecorde
 	body := o.body
 	contentType := o.contentType
 	if o.formToken != "" && body == "" {
-		body = url.Values{"gosecure.csrf": {o.formToken}, "amount": {"100"}}.Encode()
+		body = url.Values{"moat.csrf": {o.formToken}, "amount": {"100"}}.Encode()
 		if contentType == "" {
 			contentType = "application/x-www-form-urlencoded"
 		}
@@ -368,7 +368,7 @@ func TestVerification(t *testing.T) {
 				// #nosec G124 -- deliberately a bare cookie with no security
 				// attributes: it stands in for one an attacker planted, and the
 				// point of the case is that planting it achieves nothing.
-				cookie:      &http.Cookie{Name: "__Host-gosecure.csrf", Value: "attacker-chosen-value"},
+				cookie:      &http.Cookie{Name: "__Host-moat.csrf", Value: "attacker-chosen-value"},
 				headerToken: "attacker-chosen-value",
 			},
 			wantStatus: http.StatusForbidden,
@@ -578,7 +578,7 @@ func TestJSONBodyCannotSupplyTheToken(t *testing.T) {
 	}
 	cookie, tok := issue(t, p)
 
-	body := `{"gosecure.csrf": "` + tok + `"}`
+	body := `{"moat.csrf": "` + tok + `"}`
 	rec := post(t, p, postOpts{
 		cookie:      cookie,
 		contentType: "application/json",
@@ -609,7 +609,7 @@ func TestMultipartFormToken(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var body strings.Builder
 			mw := multipart.NewWriter(&body)
-			if err := mw.WriteField("gosecure.csrf", tc.token); err != nil {
+			if err := mw.WriteField("moat.csrf", tc.token); err != nil {
 				t.Fatal(err)
 			}
 			part, err := mw.CreateFormFile("upload", "photo.jpg")
@@ -684,7 +684,7 @@ func TestMalformedCookieIsReplaced(t *testing.T) {
 			r.Host = testHost
 			// #nosec G124 -- a malformed cookie with no attributes is exactly
 			// what this test needs; the assertion is that it gets replaced.
-			r.AddCookie(&http.Cookie{Name: "__Host-gosecure.csrf", Value: value})
+			r.AddCookie(&http.Cookie{Name: "__Host-moat.csrf", Value: value})
 			p.Middleware(echoHandler()).ServeHTTP(rec, r)
 
 			if rec.Code != http.StatusOK {
@@ -717,14 +717,14 @@ func TestCookieOptions(t *testing.T) {
 			// drop the cookie and break every request.
 			name:       "an insecure cookie drops the __Host- prefix",
 			opts:       []csrf.Option{csrf.WithInsecureCookie()},
-			wantName:   "gosecure.csrf",
+			wantName:   "moat.csrf",
 			wantSecure: false,
 			wantPath:   "/",
 		},
 		{
 			name:       "a Domain drops the __Host- prefix",
 			opts:       []csrf.Option{csrf.WithCookieDomain("example.com")},
-			wantName:   "gosecure.csrf",
+			wantName:   "moat.csrf",
 			wantSecure: true,
 			wantPath:   "/",
 			wantDomain: "example.com",
@@ -732,7 +732,7 @@ func TestCookieOptions(t *testing.T) {
 		{
 			name:       "a narrowed Path drops the __Host- prefix",
 			opts:       []csrf.Option{csrf.WithCookiePath("/app")},
-			wantName:   "gosecure.csrf",
+			wantName:   "moat.csrf",
 			wantSecure: true,
 			wantPath:   "/app",
 		},
@@ -901,7 +901,7 @@ func ExampleNew() {
 	r.Host = "app.example.com"
 	handler.ServeHTTP(rec, r)
 
-	fmt.Println(rec.Code, strings.Contains(rec.Body.String(), "gosecure.csrf"))
+	fmt.Println(rec.Code, strings.Contains(rec.Body.String(), "moat.csrf"))
 	// Output: 200 true
 }
 

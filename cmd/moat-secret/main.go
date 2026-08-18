@@ -1,4 +1,4 @@
-// Command gosecure-secret prints a fresh CSRF secret.
+// Command moat-secret prints a fresh CSRF secret.
 //
 // It exists because the library itself must never print. csrf.GenerateSecret
 // returns a value; this program is the one place where writing that value to
@@ -6,13 +6,13 @@
 //
 // Usage:
 //
-//	go run github.com/JonasBorgesLM/gosecure/cmd/gosecure-secret [-format hex|base64|raw]
+//	go run github.com/JonasBorgesLM/moat/cmd/moat-secret [-format hex|base64|raw]
 //
 // The output goes to stdout with no trailing commentary, so it can be piped
 // straight into a secret store:
 //
-//	gosecure-secret | op create item ...
-//	gosecure-secret > /run/secrets/csrf_key
+//	moat-secret | op create item ...
+//	moat-secret > /run/secrets/csrf_key
 //
 // Handle the result as a credential. It will otherwise end up in your shell
 // history, in your terminal scrollback, and in whatever ships those somewhere
@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
+	"github.com/JonasBorgesLM/moat/csrf"
 )
 
 // main parses flags and writes the secret. It does no work of its own so that
@@ -37,7 +37,7 @@ func main() {
 	flag.Parse()
 
 	if err := run(*format, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "gosecure-secret:", err)
+		fmt.Fprintln(os.Stderr, "moat-secret:", err)
 		os.Exit(1)
 	}
 }

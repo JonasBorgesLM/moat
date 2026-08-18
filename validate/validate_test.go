@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/JonasBorgesLM/gosecure/validate"
+	"github.com/JonasBorgesLM/moat/validate"
 )
 
 func TestRules(t *testing.T) {

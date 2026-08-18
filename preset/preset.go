@@ -45,11 +45,11 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
-	"github.com/JonasBorgesLM/gosecure/middleware"
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
-	"github.com/JonasBorgesLM/gosecure/secureheaders"
-	"github.com/JonasBorgesLM/gosecure/validate"
+	"github.com/JonasBorgesLM/moat/csrf"
+	"github.com/JonasBorgesLM/moat/middleware"
+	"github.com/JonasBorgesLM/moat/ratelimit"
+	"github.com/JonasBorgesLM/moat/secureheaders"
+	"github.com/JonasBorgesLM/moat/validate"
 )
 
 // DefaultMaxBodyBytes is the request body limit [API] applies when

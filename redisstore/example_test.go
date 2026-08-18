@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
-	"github.com/JonasBorgesLM/gosecure/redisstore"
+	"github.com/JonasBorgesLM/moat/ratelimit"
+	"github.com/JonasBorgesLM/moat/redisstore"
 	"github.com/redis/go-redis/v9"
 )
 

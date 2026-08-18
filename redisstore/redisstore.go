@@ -71,7 +71,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
+	"github.com/JonasBorgesLM/moat/ratelimit"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -89,7 +89,7 @@ var tokenBucket = redis.NewScript(script)
 const (
 	// DefaultKeyPrefix namespaces bucket keys so that they are recognizable in
 	// a shared Redis and cannot collide with other data.
-	DefaultKeyPrefix = "gosecure:ratelimit:"
+	DefaultKeyPrefix = "moat:ratelimit:"
 
 	// DefaultIdleTTL is the floor for how long an untouched bucket is kept. The
 	// effective TTL is never shorter than the bucket's full refill time.

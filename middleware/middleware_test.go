@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/JonasBorgesLM/gosecure/middleware"
+	"github.com/JonasBorgesLM/moat/middleware"
 )
 
 // tag returns a middleware that appends name to a shared trace on the way in

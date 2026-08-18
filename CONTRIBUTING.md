@@ -20,8 +20,8 @@ Do not open a public issue or pull request for it.
 ## Getting set up
 
 ```sh
-git clone https://github.com/JonasBorgesLM/gosecure
-cd gosecure
+git clone https://github.com/JonasBorgesLM/moat
+cd moat
 go work init . ./redisstore ./examples   # if go.work is not already present
 go test ./...
 ```

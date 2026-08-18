@@ -7,7 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/JonasBorgesLM/gosecure/sanitize"
+	"github.com/JonasBorgesLM/moat/sanitize"
 )
 
 func TestStripControlChars(t *testing.T) {

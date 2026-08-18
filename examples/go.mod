@@ -3,12 +3,12 @@
 //
 // It is a separate module so that gin, echo and friends never appear in the
 // go.sum of the core. See doc/DESIGN.md §2.
-module github.com/JonasBorgesLM/gosecure/examples
+module github.com/JonasBorgesLM/moat/examples
 
 go 1.25.0
 
 require (
-	github.com/JonasBorgesLM/gosecure v0.1.0
+	github.com/JonasBorgesLM/moat v0.1.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/labstack/echo/v4 v4.15.4
 )

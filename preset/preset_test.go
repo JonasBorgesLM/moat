@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
-	"github.com/JonasBorgesLM/gosecure/preset"
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
-	"github.com/JonasBorgesLM/gosecure/secureheaders"
+	"github.com/JonasBorgesLM/moat/csrf"
+	"github.com/JonasBorgesLM/moat/preset"
+	"github.com/JonasBorgesLM/moat/ratelimit"
+	"github.com/JonasBorgesLM/moat/secureheaders"
 )
 
 const host = "app.example.com"

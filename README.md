@@ -1,4 +1,4 @@
-# gosecure
+# moat
 
 Composable HTTP security middleware for Go: rate limiting, CSRF protection,
 secure response headers, input validation, and path-traversal-safe file access.
@@ -25,11 +25,6 @@ http.ListenAndServe(":8080", chain.Then(mux))
 
 > **Status: pre-1.0.** The API may change between minor versions. This library
 > has not been independently audited — see [Security](#security).
->
-> **On the name:** at least fourteen unrelated modules on pkg.go.dev are also
-> called `gosecure`, and the Go style guide discourages `go`-prefixed package
-> names. The module path here is unambiguous because it is namespaced by
-> account, but the package name is not distinctive. See `doc/DESIGN.md` §10.10.
 
 ---
 
@@ -68,14 +63,14 @@ audit that reshaped several of these APIs, is in
 ## Install
 
 ```sh
-go get github.com/JonasBorgesLM/gosecure
+go get github.com/JonasBorgesLM/moat
 ```
 
 Optional Redis-backed distributed rate limiting (separate module, pulls in
 `go-redis`):
 
 ```sh
-go get github.com/JonasBorgesLM/gosecure/redisstore
+go get github.com/JonasBorgesLM/moat/redisstore
 ```
 
 Requires **Go 1.25+**. (`pathguard` needs `os.Root`, which landed in 1.24; the
@@ -221,7 +216,7 @@ Or from a shell, where printing is your explicit intent rather than a library's
 side effect:
 
 ```sh
-go run github.com/JonasBorgesLM/gosecure/cmd/gosecure-secret
+go run github.com/JonasBorgesLM/moat/cmd/moat-secret
 ```
 
 ### Secure headers

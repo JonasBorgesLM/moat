@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/JonasBorgesLM/gosecure/pathguard"
+	"github.com/JonasBorgesLM/moat/pathguard"
 )
 
 // fixture builds a tree that contains every shape the guard has to defend

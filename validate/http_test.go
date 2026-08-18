@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/JonasBorgesLM/gosecure/validate"
+	"github.com/JonasBorgesLM/moat/validate"
 )
 
 // readAllHandler drains the body and reports what happened, mapping the

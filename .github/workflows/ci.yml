@@ -36,7 +36,7 @@ env:
   GOSUMDB: sum.golang.org
 
 jobs:
-  # The submodules require github.com/JonasBorgesLM/gosecure at a version that
+  # The submodules require github.com/JonasBorgesLM/moat at a version that
   # is not tagged yet, so they are built through a workspace pointing at the
   # working tree. Once v0.1.0 is tagged and pushed, the replace line can go.
   #
@@ -64,7 +64,7 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       - name: go build
         working-directory: ${{ matrix.module }}
@@ -119,7 +119,7 @@ jobs:
 
       - name: No sibling module may be imported by the core
         run: |
-          if go list -deps ./... | grep -E 'gosecure/(redisstore|examples)'; then
+          if go list -deps ./... | grep -E 'moat/(redisstore|examples)'; then
             echo "::error::the core module imports a submodule; the dependency arrow points one way only"
             exit 1
           fi
@@ -141,7 +141,7 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       - name: gofmt
         working-directory: ${{ matrix.module }}
@@ -187,7 +187,7 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       - name: Install govulncheck ${{ env.GOVULNCHECK_VERSION }}
         run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
@@ -244,7 +244,7 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       # Suite A: the whole chain over a real TLS server with a real cookie jar.
       # Standard library only, no infrastructure.

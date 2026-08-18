@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
+	"github.com/JonasBorgesLM/moat/ratelimit"
 	"github.com/redis/go-redis/v9"
 )
 

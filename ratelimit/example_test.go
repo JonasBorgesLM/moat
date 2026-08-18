@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/ratelimit"
+	"github.com/JonasBorgesLM/moat/ratelimit"
 )
 
 func ExampleNew() {

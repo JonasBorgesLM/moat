@@ -17,9 +17,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
-	"github.com/JonasBorgesLM/gosecure/middleware"
-	"github.com/JonasBorgesLM/gosecure/preset"
+	"github.com/JonasBorgesLM/moat/csrf"
+	"github.com/JonasBorgesLM/moat/middleware"
+	"github.com/JonasBorgesLM/moat/preset"
 )
 
 // Adapt converts a standard func(http.Handler) http.Handler into a

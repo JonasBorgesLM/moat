@@ -95,13 +95,13 @@ const MinSecretLen = 32
 // a cookie so named is only accepted when it is Secure, has Path=/, and has no
 // Domain attribute, so no subdomain can overwrite it.
 const (
-	DefaultCookieName = "__Host-gosecure.csrf"
-	DefaultFieldName  = "gosecure.csrf"
+	DefaultCookieName = "__Host-moat.csrf"
+	DefaultFieldName  = "moat.csrf"
 	DefaultHeaderName = "X-CSRF-Token"
 
 	// fallbackCookieName is used when the configuration makes the __Host-
 	// prefix invalid, since a browser would otherwise silently drop the cookie.
-	fallbackCookieName = "gosecure.csrf"
+	fallbackCookieName = "moat.csrf"
 )
 
 // DefaultMaxAge is how long an issued cookie remains valid.
@@ -211,7 +211,7 @@ func (p *Protector) hostPrefixValid() bool {
 // container logs, and in whatever aggregates them. Store the result the way you
 // store other secrets.
 //
-// The cmd/gosecure-secret helper wraps this for command-line use, where
+// The cmd/moat-secret helper wraps this for command-line use, where
 // printing is the caller's explicit intent rather than a library's side effect.
 func GenerateSecret() ([]byte, error) {
 	secret := make([]byte, MinSecretLen)

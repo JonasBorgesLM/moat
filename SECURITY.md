@@ -5,7 +5,7 @@
 Stated plainly, up front, because it is the single most important thing to know
 before depending on this code:
 
-**`gosecure` has not been reviewed by an independent security auditor.** It
+**`moat` has not been reviewed by an independent security auditor.** It
 implements well-understood patterns — token-bucket rate limiting, signed
 double-submit CSRF tokens, `os.Root`-based path containment — carefully, and it
 writes down its reasoning in [`doc/DESIGN.md`](./doc/DESIGN.md) so that the
@@ -23,8 +23,8 @@ receives security fixes.
 
 | Module | Supported |
 |---|---|
-| `github.com/JonasBorgesLM/gosecure` (core) | latest `v0.x` tag |
-| `github.com/JonasBorgesLM/gosecure/redisstore` | latest `redisstore/v0.x` tag |
+| `github.com/JonasBorgesLM/moat` (core) | latest `v0.x` tag |
+| `github.com/JonasBorgesLM/moat/redisstore` | latest `redisstore/v0.x` tag |
 | `examples/` | not supported; illustrative code, not a released artifact |
 
 Older `v0.x` tags are not patched. Because the API may still change between
@@ -39,7 +39,7 @@ there is a fix to upgrade to.
 
 Report privately through **GitHub's private vulnerability reporting**:
 
-1. Go to <https://github.com/JonasBorgesLM/gosecure/security/advisories/new>
+1. Go to <https://github.com/JonasBorgesLM/moat/security/advisories/new>
    (or the repository's **Security** tab → **Report a vulnerability**).
 2. Fill in the advisory form. The report is visible only to the maintainers
    until it is published.

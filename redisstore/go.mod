@@ -2,12 +2,12 @@
 //
 // It is a separate module so that go-redis never appears in the go.sum of
 // consumers who only import the core packages. See doc/DESIGN.md §2.
-module github.com/JonasBorgesLM/gosecure/redisstore
+module github.com/JonasBorgesLM/moat/redisstore
 
 go 1.25.0
 
 require (
-	github.com/JonasBorgesLM/gosecure v0.1.0
+	github.com/JonasBorgesLM/moat v0.1.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 )

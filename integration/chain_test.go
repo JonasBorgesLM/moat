@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
-	"github.com/JonasBorgesLM/gosecure/pathguard"
-	"github.com/JonasBorgesLM/gosecure/preset"
+	"github.com/JonasBorgesLM/moat/csrf"
+	"github.com/JonasBorgesLM/moat/pathguard"
+	"github.com/JonasBorgesLM/moat/preset"
 )
 
 // harness is a running server plus a client that behaves like a browser: it

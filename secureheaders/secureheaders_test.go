@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JonasBorgesLM/gosecure/secureheaders"
+	"github.com/JonasBorgesLM/moat/secureheaders"
 )
 
 // serve runs one request through the middleware and reports the response

@@ -10,7 +10,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"github.com/JonasBorgesLM/gosecure/csrf"
+	"github.com/JonasBorgesLM/moat/csrf"
 )
 
 const host = "app.example.com"
