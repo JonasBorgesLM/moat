@@ -1,0 +1,230 @@
+# Contributing
+
+Thanks for considering it. This is a security library, so a few of the rules
+below are stricter than you may be used to. They exist because the cost of a
+quiet mistake here is paid by someone else's users.
+
+**Found a vulnerability? Stop and read [`SECURITY.md`](./SECURITY.md) instead.**
+Do not open a public issue or pull request for it.
+
+## The short version
+
+1. The core module imports the standard library and nothing else.
+2. Every exported symbol has a doc comment. For anything security-relevant, the
+   comment explains the threat, not just the signature.
+3. Tests cover the attacks a component defends against, not only the happy path.
+4. A change to a security property comes with a matching change to
+   [`doc/DESIGN.md`](./doc/DESIGN.md). The reasoning is part of the deliverable.
+5. The library never logs, prints, or panics in normal operation.
+
+## Getting set up
+
+```sh
+git clone https://github.com/JonasBorgesLM/gosecure
+cd gosecure
+go work init . ./redisstore ./examples   # if go.work is not already present
+go test ./...
+```
+
+`go.work` is deliberately **not committed**: it is a local development
+convenience, and a committed workspace file changes how the modules resolve for
+everyone who clones the repo. Create your own.
+
+Because this is a multi-module repository, `go test ./...` at the root **does
+not descend into `redisstore/` or `examples/`**. Test each module:
+
+```sh
+go test -race ./...
+(cd redisstore && go test -race ./...)
+(cd examples   && go test -race ./...)
+```
+
+Integration suites sit behind a build tag so that the default run needs no
+Docker and no network:
+
+```sh
+go test -tags=integration ./integration/...
+(cd redisstore && go test -tags=integration ./...)
+```
+
+## The dependency rule
+
+**The core module depends on the Go standard library only.** This is not
+minimalism for its own sake. Go resolves dependencies per module, so anything in
+the core `go.mod` appears in the `go.sum` of every consumer — and in their SBOM,
+their Dependabot alerts, and their `govulncheck` output — even if they only
+import `secureheaders`. Keeping the core at zero dependencies makes that claim
+literally true and machine-verifiable, and keeps the whole implementation
+auditable in one sitting.
+
+Practically:
+
+- A pull request that adds a `require` line to the root `go.mod` will be
+  declined. If you need a third-party library, the feature belongs in its own
+  module, the way `redisstore/` does.
+- `redisstore/` may depend on `go-redis`. `examples/` may depend on the
+  frameworks it demonstrates. Neither may be imported by the core.
+- Test-only dependencies count. Use the standard library's `testing`,
+  `net/http/httptest`, and hand-written helpers.
+
+## Code standards
+
+### Doc comments carry the threat model
+
+Every exported identifier needs a doc comment, and `go vet` is not the standard
+here — the standard is that a reader can tell **what breaks if they get this
+wrong**. Compare:
+
+```go
+// WithKeyFunc sets the key function.                     // useless
+```
+
+```go
+// WithKeyFunc replaces the function that derives a bucket key from a request.
+//
+// The default deliberately ignores X-Forwarded-For because it is supplied by
+// the client: keying on it lets an attacker present a new identity with every
+// request and bypass the limit entirely. Only read a forwarded header after
+// verifying that r.RemoteAddr belongs to a proxy you control.
+```
+
+The second one prevents a real, common, catastrophic misconfiguration. That is
+the bar.
+
+### Middleware shape
+
+Every middleware is `func(http.Handler) http.Handler`. No custom handler types,
+no framework interfaces in the core. Framework glue lives in `examples/` as
+compiled, tested code — never as prose in a README, which rots into confidently
+wrong advice.
+
+Middleware must not consume the request body unless it is rejecting the request:
+the handler behind it usually needs the body too.
+
+### No logging, no printing, no panicking
+
+The library never writes to stdout or stderr and never holds a logger. Errors
+are returned, or surfaced through hooks such as `ratelimit.WithOnError`, so the
+host application owns observability. A library that prints is unusable in a
+serious application, and a library that panics on untrusted input is a denial of
+service.
+
+Panicking on a programmer error at construction time is also out: constructors
+return errors, or clamp obviously-invalid values to their **safe** extreme and
+document that they do.
+
+### Secure by default
+
+A default is the behavior someone gets when they have not thought about the
+question. It must be the safe one. Every relaxation is an explicit, named,
+greppable opt-in, so that it is visible in code review — `WithoutCSP()`,
+`DisableCSRF: true`, `FailOpen`. If you find yourself adding a default that is
+convenient rather than safe, that is a design discussion for an issue first.
+
+### Errors
+
+Return errors; wrap with `%w` so `errors.Is` works across package boundaries.
+Do not put attacker-controlled input into an error string that might be returned
+to the client — an error message that echoes the request is a reflection
+primitive.
+
+## Tests
+
+`go test -race ./...` must pass before you open a pull request, in every module
+you touched.
+
+### Table-driven where it fits
+
+Most tests here are a slice of cases with a name, an input, and an expectation.
+Use `t.Run` so a failure names itself.
+
+### Attack cases are mandatory
+
+A test that only proves the feature works when used correctly does not tell us
+whether the security property holds. Every component needs tests for what it
+defends against. For example:
+
+- `ratelimit`: spoofed `X-Forwarded-For` does not mint a fresh bucket;
+  concurrent `Take` calls never exceed the burst; an unbounded stream of distinct
+  keys does not grow the store without bound; an idle bucket is not discarded
+  before it would have refilled.
+- `csrf`: a token from another user, another origin, or a rotated secret is
+  rejected; a missing cookie is rejected; comparison is constant-time.
+- `pathguard`: `../`, absolute paths, symlinks pointing outside the root, and
+  encoded traversal all fail to escape.
+- `validate`: a body one byte over the limit is rejected, and a lying
+  `Content-Length` does not get past the reader.
+
+If you fix a bug, the regression test should demonstrate the attack, not just
+the symptom.
+
+### Examples are tests
+
+Every public package has at least one `ExampleXxx` in a `_test.go` file. They are
+compiled by `go test` and rendered on pkg.go.dev, which is what keeps the
+documentation from drifting away from the API.
+
+Examples that depend on wall-clock timing or on the network are written
+**compile-only** — no `// Output:` line — rather than as flaky tests. A flaky
+example teaches contributors to ignore red CI, which is a security problem
+eventually.
+
+### Fuzzing
+
+`pathguard`, `validate` and `sanitize` carry fuzz targets, and they are treated
+as a security control rather than decoration. "No input ever resolves outside
+the root" is a far stronger claim than a handful of `../../` cases. If you touch
+those packages, run the corpus:
+
+```sh
+go test -fuzz=FuzzResolve -fuzztime=60s ./pathguard
+```
+
+Add any input that finds a bug to `testdata/fuzz/` as a seed.
+
+## Design changes
+
+[`doc/DESIGN.md`](./doc/DESIGN.md) is the authoritative record of what the
+library does and **why**, including the alternatives that were rejected and the
+audit findings that reshaped several APIs. It is not generated from the code and
+it is not optional reading.
+
+If your change affects a security property, an API shape, or a default, update
+`doc/DESIGN.md` in the same pull request. State the reasoning and, if you are
+overturning an earlier decision, say which one and why it was wrong. A reviewer
+should be able to audit the argument, not just the diff.
+
+For anything larger than a bug fix, open an issue first. It is much cheaper to
+disagree about a design in an issue than in a finished pull request.
+
+## Pull requests
+
+- One logical change per pull request.
+- Explain the threat or bug in the description, not only the mechanism.
+- `gofmt` (not just `go fmt` on your editor's whim), `go vet`, and the linters
+  in CI must be clean.
+- CI runs, per module: `go vet`, `staticcheck`, `gosec`, `go build`,
+  `go test -race -cover`, a short fuzz run, and `govulncheck`.
+- **All CI tooling is version-pinned.** Do not add a step that runs
+  `go install some/tool@latest`: it is non-reproducible, and it means a
+  compromise of that tool's repository executes in our CI. That is precisely the
+  supply-chain risk this project exists to take seriously.
+
+## Commit messages
+
+Short imperative subject, prefixed with the package: `ratelimit: fail closed
+when the store errors`. Explain *why* in the body if it is not obvious. Link the
+issue.
+
+## Versioning
+
+Modules are tagged independently: `v0.3.0` for the core, `redisstore/v0.3.0` for
+the store. The project stays on `v0.x` until the API has been used in anger;
+claiming `v1` early is a compatibility promise we are not yet in a position to
+keep. Post-v1, a breaking change needs a new major version and module path
+suffix.
+
+## License
+
+By contributing you agree that your contributions are licensed under the MIT
+License, the same as the rest of the project.

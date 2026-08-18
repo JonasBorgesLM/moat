@@ -1,0 +1,282 @@
+# CI for a multi-module repository.
+#
+# Two things drive the shape of this file:
+#
+#   1. `go test ./...` at the root does NOT descend into redisstore/ or
+#      examples/. Go resolves per module, so every job runs per module or the
+#      submodules are simply never built.
+#   2. Every tool is pinned to an exact version. `go install tool@latest` in CI
+#      is not reproducible -- today's green build says nothing about tomorrow's
+#      -- and it means whoever controls that tool's repository gets code
+#      execution in our pipeline. In a library that markets minimal
+#      dependencies as a security property, that would be indefensible.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so that a newly published vulnerability in a dependency is found
+    # by govulncheck rather than by a user.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  # Pinned tool versions. Bump these deliberately, in their own commit.
+  STATICCHECK_VERSION: v0.7.0
+  GOSEC_VERSION: v2.28.0
+  GOVULNCHECK_VERSION: v1.7.0
+  # Fail the build rather than silently fetching a module whose checksum is not
+  # in the transparency log.
+  GOFLAGS: -mod=readonly
+  GONOSUMDB: ""
+  GOSUMDB: sum.golang.org
+
+jobs:
+  # The submodules require github.com/JonasBorgesLM/gosecure at a version that
+  # is not tagged yet, so they are built through a workspace pointing at the
+  # working tree. Once v0.1.0 is tagged and pushed, the replace line can go.
+  #
+  # go.work is not committed (see .gitignore): a committed workspace changes how
+  # modules resolve for everyone who clones the repo.
+  build:
+    name: build & test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "redisstore", "examples"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+          cache-dependency-path: |
+            go.sum
+            redisstore/go.sum
+            examples/go.sum
+
+      - name: Create the development workspace
+        run: |
+          go work init . ./redisstore ./examples
+          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+
+      - name: go build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+      - name: go vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      - name: go test -race
+        working-directory: ${{ matrix.module }}
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Report coverage
+        working-directory: ${{ matrix.module }}
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.module == '.' && 'core' || matrix.module }}
+          path: ${{ matrix.module }}/coverage.out
+          if-no-files-found: warn
+
+  # The zero-dependency claim is the core module's most load-bearing promise, so
+  # it is asserted mechanically rather than trusted.
+  zero-dependencies:
+    name: core module has no dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: The core go.mod must have no requires
+        run: |
+          if grep -qE '^\s*require' go.mod; then
+            echo "::error file=go.mod::the core module has acquired a dependency; it must depend on the standard library only"
+            grep -nE '^\s*require' -A20 go.mod
+            exit 1
+          fi
+
+      - name: The core must have no go.sum
+        run: |
+          if [ -f go.sum ]; then
+            echo "::error file=go.sum::the core module has a go.sum, so it has dependencies"
+            cat go.sum
+            exit 1
+          fi
+
+      - name: No sibling module may be imported by the core
+        run: |
+          if go list -deps ./... | grep -E 'gosecure/(redisstore|examples)'; then
+            echo "::error::the core module imports a submodule; the dependency arrow points one way only"
+            exit 1
+          fi
+
+  lint:
+    name: staticcheck & gosec (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "redisstore", "examples"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Create the development workspace
+        run: |
+          go work init . ./redisstore ./examples
+          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+
+      - name: gofmt
+        working-directory: ${{ matrix.module }}
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # Pinned by exact version. Not @latest.
+      - name: Install staticcheck ${{ env.STATICCHECK_VERSION }}
+        run: go install honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }}
+
+      - name: staticcheck
+        working-directory: ${{ matrix.module }}
+        run: staticcheck ./...
+
+      - name: Install gosec ${{ env.GOSEC_VERSION }}
+        run: go install github.com/securego/gosec/v2/cmd/gosec@${{ env.GOSEC_VERSION }}
+
+      - name: gosec
+        working-directory: ${{ matrix.module }}
+        # -tests scans the test files too: an attack case that no longer
+        # compiles is an attack case that is no longer being run.
+        run: gosec -tests -exclude-generated ./...
+
+  govulncheck:
+    name: govulncheck (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "redisstore", "examples"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Create the development workspace
+        run: |
+          go work init . ./redisstore ./examples
+          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+
+      - name: Install govulncheck ${{ env.GOVULNCHECK_VERSION }}
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
+
+      - name: govulncheck
+        working-directory: ${{ matrix.module }}
+        run: govulncheck ./...
+
+  # Fuzzing is treated as a security control, not decoration. "No input ever
+  # resolves outside the root" is a far stronger claim than a handful of
+  # hand-written ../.. cases, and it only stays true if it keeps being checked.
+  fuzz:
+    name: short fuzz run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: pathguard containment
+        run: go test -run=XXX -fuzz=FuzzResolve -fuzztime=30s ./pathguard
+
+      - name: sanitize invariants
+        run: |
+          go test -run=XXX -fuzz=FuzzStripControlChars -fuzztime=30s ./sanitize
+          go test -run=XXX -fuzz=FuzzCollapseWhitespace -fuzztime=30s ./sanitize
+          go test -run=XXX -fuzz=FuzzPlainText -fuzztime=30s ./sanitize
+
+      - name: validate rules
+        run: go test -run=XXX -fuzz=FuzzRules -fuzztime=30s ./validate
+
+      # A crasher is written to testdata/fuzz and would otherwise be lost with
+      # the runner. Keeping it means the failing input can be added as a seed.
+      - name: Upload any crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Create the development workspace
+        run: |
+          go work init . ./redisstore ./examples
+          go work edit -replace github.com/JonasBorgesLM/gosecure@v0.1.0=./
+
+      # Suite A: the whole chain over a real TLS server with a real cookie jar.
+      # Standard library only, no infrastructure.
+      - name: Suite A -- full chain over HTTP
+        run: go test -tags=integration -race ./integration/...
+
+      # Suite B: the Redis store against a real Redis, started by
+      # testcontainers. It lives in the redisstore module because testcontainers
+      # is a dependency, and a test-only dependency in the core module would
+      # still land in every consumer's go.sum.
+      #
+      # ubuntu-latest runners have Docker available.
+      - name: Suite B -- redisstore against real Redis
+        working-directory: redisstore
+        run: go test -tags=integration -race ./...
+
+  dependency-review:
+    name: dependency review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4
+        with:
+          # A new dependency in this repository is a design decision, so
+          # anything with a known vulnerability at any severity fails the build
+          # rather than being triaged later.
+          fail-on-severity: low
+          # Copyleft licenses would change the terms this library ships under.
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.1, LGPL-3.0
+          comment-summary-in-pr: on-failure

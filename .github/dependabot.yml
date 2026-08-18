@@ -1,0 +1,67 @@
+# Dependabot must be told about each module separately: it reads one go.mod per
+# `directory` entry, and this repository has three. A missing entry means that
+# module's dependencies are never checked, which is a silent gap rather than a
+# visible failure.
+version: 2
+
+updates:
+  # The core module. It has no dependencies today and is supposed to keep it
+  # that way, so this entry exists mainly as a tripwire: if Dependabot ever
+  # opens a pull request here, something has been added that should not have
+  # been. The zero-dependencies CI job fails on the same condition.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, core-module]
+    commit-message:
+      prefix: "core:"
+
+  # The Redis store: go-redis, plus testcontainers for the integration suite.
+  - package-ecosystem: gomod
+    directory: /redisstore
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, redisstore]
+    commit-message:
+      prefix: "redisstore:"
+    groups:
+      # Test-only tooling moves often and rarely needs individual review.
+      test-tooling:
+        patterns:
+          - "github.com/testcontainers/*"
+          - "github.com/docker/*"
+
+  # The examples: gin, echo and their transitive dependencies. These never
+  # reach a consumer of the library, but they must keep compiling, because an
+  # adapter that has stopped working is worse than no adapter.
+  - package-ecosystem: gomod
+    directory: /examples
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, examples]
+    commit-message:
+      prefix: "examples:"
+    groups:
+      frameworks:
+        patterns:
+          - "github.com/gin-gonic/*"
+          - "github.com/labstack/*"
+
+  # The workflow files themselves. Actions are pinned by major version above;
+  # this keeps that pin from going stale, and an action update is a
+  # supply-chain change that deserves the same review as a code dependency.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci:"
