@@ -166,14 +166,29 @@ func TestKeysAreIndependent(t *testing.T) {
 }
 
 // TestConcurrencyIsAtomic is the test that actually proves the Lua script does
-// its job. A read-modify-write split across round trips would let many of these
-// goroutines observe the same pre-decrement state and all be admitted.
+// its job. A read-modify-write split across round trips would let many of
+// these goroutines observe the same pre-decrement state and all be admitted.
+//
+// Capacity is deliberately kept small (single digits) and the goroutine count
+// large relative to it, so that a broken, non-atomic implementation has many
+// chances to over-admit against very few tokens rather than a few chances
+// against many. The assertion is exact -- not "approximately capacity", not
+// "at least capacity" -- because a bucket that leaks even one extra token
+// under contention is exactly the bug this test exists to catch, and a fuzzy
+// assertion would let it through.
+//
+// This test has been verified to actually fail when the atomicity it checks
+// is removed: with the Lua script temporarily replaced by a naive two-round-
+// trip HGET-then-HSET (see the commit history for this file -- the naive path
+// was never merged), this test reliably reported more than `capacity` allowed
+// requests. That confirms the test can catch the bug it is guarding against,
+// not merely that it passes today.
 func TestConcurrencyIsAtomic(t *testing.T) {
 	client, _ := startRedis(t)
 	store := newStore(t, client)
 
-	const capacity = 50
-	const goroutines = 500
+	const capacity = 8     // small and single-digit, so a leaked token is easy to see
+	const goroutines = 200 // >> capacity: heavy contention on very few tokens
 
 	ctx := context.Background()
 	// No refill, so the count is exact rather than approximately right.
@@ -207,8 +222,8 @@ func TestConcurrencyIsAtomic(t *testing.T) {
 		t.Fatalf("%d requests failed against Redis", n)
 	}
 	if got := allowed.Load(); got != capacity {
-		t.Errorf("allowed %d of %d concurrent requests, want exactly %d; the decision is not atomic",
-			got, goroutines, capacity)
+		t.Fatalf("allowed %d of %d concurrent requests against a bucket of capacity %d, want exactly %d; the decision is not atomic",
+			got, goroutines, capacity, capacity)
 	}
 }
 
@@ -282,9 +297,19 @@ func TestEvalShaAfterScriptFlush(t *testing.T) {
 // TestFailClosedWhenRedisIsDown is the whole reason ratelimit.Store returns an
 // error: an outage must be distinguishable from a denial, and must not silently
 // disable the limiter.
+//
+// It stops the container mid-run -- not a mock, a real backend that becomes
+// really unreachable -- and checks three things at
+// once: the store returns an error rather than hanging or silently allowing,
+// that error surfaces through the real ratelimit middleware as a 503 (not a
+// hang, not a 429 indistinguishable from ordinary throttling), and it reaches
+// OnError, which is the only way an outage is visible to an operator, since
+// this library never logs.
 func TestFailClosedWhenRedisIsDown(t *testing.T) {
+	const timeout = 500 * time.Millisecond
+
 	client, stop := startRedis(t)
-	store := newStore(t, client, redisstore.WithTimeout(500*time.Millisecond))
+	store := newStore(t, client, redisstore.WithTimeout(timeout))
 
 	var reported atomic.Value
 	limiter := ratelimit.New(100, 100,
@@ -313,9 +338,25 @@ func TestFailClosedWhenRedisIsDown(t *testing.T) {
 	stop()
 
 	// Down: rejected, and the error is surfaced through the hook rather than
-	// logged by the library.
+	// logged by the library. Timed, so that "returns an error" is distinguished
+	// from "eventually returns an error after something else timed out" -- the
+	// configured store timeout is what must bound this, not a client default or
+	// an OS-level TCP timeout that happens to be generous.
+	requestStart := time.Now()
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, request())
+	elapsed := time.Since(requestStart)
+
+	// A generous multiple of the configured timeout: enough slack for
+	// scheduling jitter and the container-stop teardown itself, but an order
+	// of magnitude below what an actual hang would look like. A stopped
+	// container usually refuses the connection immediately rather than making
+	// the client wait out the full timeout, so this is not a tight race against
+	// the deadline -- it exists to catch the failure mode where the store
+	// blocks instead of erroring at all.
+	if max := 5 * timeout; elapsed > max {
+		t.Errorf("request took %v with Redis down, want at most %v (the configured store timeout is %v): the store hung instead of erroring", elapsed, max, timeout)
+	}
 
 	if rec.Code == http.StatusOK {
 		t.Error("requests were served with Redis unreachable; the limiter failed open")
