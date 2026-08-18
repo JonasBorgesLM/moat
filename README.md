@@ -115,12 +115,13 @@ chain, err := preset.API(preset.Config{
 })
 ```
 
-The order `preset.API` fixes is: rate limit, security headers, body size limit,
-CSRF. The body limit must precede CSRF because CSRF parses form-encoded bodies,
-and doing that before a bound is in place is the ordering bug that makes an
-oversized form a problem. One consequence worth knowing: because the limiter
-runs first and short-circuits, a `429` does **not** carry the security headers.
-Compose the chain by hand with `secureheaders` first if you need them there.
+The order `preset.API` fixes is: security headers, rate limit, body size limit,
+CSRF. Headers run outermost so that every response carries them, including a
+`429` from the rate limiter or a `403` from CSRF — an error response is still a
+response, and is exactly as capable of being framed or rendered without a CSP
+as a `200` is. The body limit must precede CSRF because CSRF parses
+form-encoded bodies, and doing that before a bound is in place is the ordering
+bug that makes an oversized form a problem.
 
 `preset.API` **returns an error** if a protection would be silently missing.
 Skipping CSRF is possible, but only by saying so:
@@ -147,8 +148,8 @@ style issue:
 
 ```go
 chain := middleware.New(
-    limiter.Middleware,               // 1. cheapest check first
-    secureheaders.Middleware(),       // 2. cheap, no reason to delay
+    secureheaders.Middleware(),       // 1. outermost, so every response gets these — even the rejections below
+    limiter.Middleware,               // 2. turn away abusive clients before spending more work
     validate.MaxBodyBytes(1<<20),     // 3. BEFORE anything that reads the body
     protector.Middleware,             // 4. CSRF can now read a bounded body
 )

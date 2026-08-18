@@ -164,7 +164,7 @@ func Headers(opts ...secureheaders.Option) middleware.Chain {
 	return middleware.New(secureheaders.Middleware(opts...))
 }
 
-// API returns a chain wiring rate limiting, security headers, a request body
+// API returns a chain wiring security headers, rate limiting, a request body
 // limit and CSRF protection, in that order.
 //
 // It fails rather than silently omitting a protection: a missing CSRF secret or
@@ -173,22 +173,21 @@ func Headers(opts ...secureheaders.Option) middleware.Chain {
 //
 // # The order, and what it buys
 //
-//  1. Rate limiting, so that an abusive client is turned away before anything
-//     else spends work on it.
-//  2. Security headers, set on the way in so that every response carries them,
-//     including the errors written by the middleware that follow.
+//  1. Security headers, set on the way in so that every response carries them
+//     — including a rate-limit rejection, a CSRF rejection, or any other error
+//     written by the middleware that follow. An error response is still a
+//     response: it is exactly as capable of being framed, sniffed as a
+//     different content type, or rendered without a CSP as a 200 is, and it is
+//     a well-known injection surface in its own right. Putting headers first
+//     costs a handful of map writes on every request in exchange for never
+//     shipping an unprotected error page.
+//  2. Rate limiting, so that an abusive client is turned away before anything
+//     further downstream spends work on it.
 //  3. The body size limit, before anything reads or parses a body.
 //  4. CSRF, which may parse a form-encoded body — and can now only ever parse a
 //     bounded one. This ordering is the whole reason the pair is fixed here:
 //     reversed, an attacker's oversized form body would be parsed in full
 //     before any limit applied.
-//
-// One consequence is worth stating plainly rather than leaving to be
-// discovered: because the limiter runs first and short-circuits, a 429 response
-// does **not** carry the security headers. If you need them on rate-limit
-// rejections too, compose the chain yourself with secureheaders first — the
-// header middleware is a handful of map writes, so putting it ahead of the
-// limiter costs effectively nothing.
 //
 // # Lifetime
 //
@@ -201,6 +200,8 @@ func API(cfg Config) (middleware.Chain, error) {
 	}
 
 	var mw []middleware.Middleware
+
+	mw = append(mw, secureheaders.Middleware(cfg.HeaderOptions...))
 
 	if !cfg.DisableRateLimit {
 		opts := []ratelimit.Option{}
@@ -215,8 +216,6 @@ func API(cfg Config) (middleware.Chain, error) {
 		limiter := ratelimit.New(cfg.RateLimitBurst, cfg.RateLimitPerSec, opts...)
 		mw = append(mw, limiter.Middleware)
 	}
-
-	mw = append(mw, secureheaders.Middleware(cfg.HeaderOptions...))
 
 	maxBody := cfg.MaxBodyBytes
 	if maxBody == 0 {

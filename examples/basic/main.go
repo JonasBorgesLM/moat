@@ -108,13 +108,16 @@ func newServer(secret []byte, publicDir string) (http.Handler, func(), error) {
 	// Read this top to bottom: it is the order requests traverse the pipeline.
 	// Every line's position is load-bearing.
 	chain := middleware.New(
-		// 1. Reject abusive clients before spending anything else on them.
-		limiter.Middleware,
-
-		// 2. Response headers. Cheap, and set on the way in so that every
-		//    response carries them -- including the rejections written by the
-		//    middleware below.
+		// 1. Response headers, outermost. Cheap, and set on the way in so
+		//    that every response carries them -- including the rejections
+		//    written by the middleware below. An error response is still a
+		//    response: it can be framed, sniffed as a different content
+		//    type, or rendered without a CSP exactly as easily as a 200 can,
+		//    so there is no ordering reason to put anything ahead of this.
 		secureheaders.Middleware(),
+
+		// 2. Reject abusive clients before spending anything else on them.
+		limiter.Middleware,
 
 		// 3. Bound the body BEFORE anything can read or parse it. Reversing
 		//    this line and the next is a real vulnerability, not a style

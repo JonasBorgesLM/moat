@@ -310,6 +310,17 @@ func TestRateLimitOverTheWire(t *testing.T) {
 	if lastResp.Header.Get("RateLimit-Limit") != strconv.Itoa(burst) {
 		t.Errorf("RateLimit-Limit = %q, want %d", lastResp.Header.Get("RateLimit-Limit"), burst)
 	}
+
+	// secureheaders runs outermost in preset.API specifically so that a
+	// rejection never ships unprotected -- an error response is still a
+	// response, and is exactly as capable of being framed or rendered without
+	// a CSP as a 200 is. Checked here, over a real connection against a real
+	// 429, rather than only against the in-process preset unit tests.
+	for _, header := range []string{"Content-Security-Policy", "X-Content-Type-Options", "Strict-Transport-Security"} {
+		if lastResp.Header.Get(header) == "" {
+			t.Errorf("429 response missing %s", header)
+		}
+	}
 }
 
 // TestOversizedBodyIsRejected exercises the limit against a real body written

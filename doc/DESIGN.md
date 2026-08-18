@@ -104,8 +104,8 @@ in `examples/` — never by importing those frameworks into the core.
 
 ```go
 chain := middleware.New(
-    limiter.Middleware,
     secureheaders.Middleware(),
+    limiter.Middleware,
     validate.MaxBodyBytes(1 << 20),
     protector.Middleware,
 )
@@ -144,8 +144,19 @@ Two hard rules, both consequences of the audit (§6.2):
    silently missing protection.** Omitting CSRF requires
    `DisableCSRF: true` — a deliberate, greppable, code-reviewable decision
    rather than an accident of leaving a field zero.
-2. **`preset` owns middleware ordering.** The safe order is an implementation
-   detail of the preset, tested in integration tests.
+2. **`preset` owns middleware ordering.** The order is fixed inside `API`
+   rather than left to the caller, and is covered by tests:
+
+   1. `secureheaders`, outermost, so that every response carries the security
+      headers — including a rejection written by any middleware that follows.
+      An error response is still a response, and is a well-known injection
+      surface in its own right; losing `nosniff` or the CSP on it specifically
+      is not a place to save a handful of map writes (§10.6).
+   2. `ratelimit`, so that an abusive client is turned away before anything
+      further downstream spends work on it.
+   3. `validate.MaxBodyBytes`, before anything reads or parses a body.
+   4. `csrf`, which may parse a form-encoded body — and can now only ever
+      parse a bounded one, because the size limit runs first (§6.1).
 
 `preset.Headers()` is the no-parameters-needed subset (response headers only) —
 the true analogue of calling `helmet()` bare — and is honest about being only
@@ -252,6 +263,13 @@ Secure by default: strict CSP, `DENY` framing, one-year HSTS with
 `includeSubDomains`. Loosening any of these is an explicit, visible opt-in via
 functional options. `preload` is off by default and documented as effectively
 irreversible.
+
+In `preset.API` this middleware runs outermost, before rate limiting or CSRF
+(§3.3). The headers are the cheapest check in the chain and apply to every
+response the chain produces, including the ones the other middleware reject —
+so there is no ordering reason to delay them, and a real reason not to: an
+error page is exactly as capable of being framed, sniffed as a different
+content type, or rendered without a CSP as a success response is.
 
 ### 4.5 `validate` and `sanitize`
 
@@ -511,19 +529,31 @@ This is a real behavioral constraint for deployments that use absolute symlinks
 for release switching, and it is documented in the package rather than left to
 be discovered in production. See the `inside-abs` case in `TestOpenAndResolve`.
 
-### 10.6 `preset.API` leaves a 429 without security headers
+### 10.6 `preset.API` left a 429 without security headers — since fixed
 
-The order fixed in §3.3 puts the rate limiter outermost, so a rejected request
-short-circuits before the header middleware runs. A 429 therefore carries no
-CSP, no `nosniff`, and no framing protection.
+**Superseded.** The order originally shipped put the rate limiter outermost, so
+a rejected request short-circuited before the header middleware ran. A 429
+therefore carried no CSP, no `nosniff`, and no framing protection. That was
+recorded here as an accepted, deliberate trade-off — do not spend work on a
+request you are about to reject — with the header middleware left available to
+move first by hand for anyone who cared.
 
-The ordering is kept, because the reasoning for it — do not spend work on a
-request you are going to reject — still holds. But the consequence is a small
-real gap, the header middleware is only a handful of map writes, and callers who
-care can put `secureheaders` first with a hand-composed `middleware.Chain`. It is
-documented on `preset.API` and pinned by a test named for the fact that it is a
-documented consequence rather than a desirable one, so that the documentation
-cannot quietly drift away from the behavior.
+That trade-off was reconsidered and reversed rather than shipped. An error
+response is still a response: it is exactly as capable of being framed, sniffed
+as a different content type, or rendered without a CSP as a 200 is, and a
+rejection is a well-known place for an attacker to look for exactly this kind
+of gap — losing `nosniff` and the CSP there specifically is not the six map
+writes are worth saving. `secureheaders` now runs outermost in `preset.API`
+(§3.3), ahead of rate limiting, so every response the chain produces carries
+the headers, including every rejection the middleware behind it write. The test
+that pinned the old behavior — deliberately named for the fact that it
+documented a bug rather than a feature — has been rewritten to assert the
+opposite: that a 429 does carry the security headers.
+
+This entry is kept rather than deleted for the same reason §6.10 was kept
+after the rename in §10.10: a design record that quietly rewrites its own
+history is worth less than one that shows the trade-off actually being made,
+and then being unmade once it turned out not to be worth it.
 
 ### 10.7 The Redis integration suite cannot live in `integration/`
 

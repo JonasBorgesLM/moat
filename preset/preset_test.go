@@ -222,10 +222,14 @@ func TestMiddlewareOrder(t *testing.T) {
 		}
 	})
 
-	// The documented consequence of putting the limiter first: a 429 does not
-	// carry the security headers. Asserted so the documentation stays true, not
-	// because the behavior is desirable.
-	t.Run("documented: a 429 does not carry security headers", func(t *testing.T) {
+	// Security headers run outermost, ahead of the rate limiter, specifically
+	// so that a rejection never ships unprotected: an error response is still
+	// a response, and is exactly as capable of being framed, sniffed as a
+	// different content type, or rendered without a CSP as a 200 is. This
+	// used to be a documented gap -- a 429 carried none of these headers --
+	// and was fixed rather than shipped; this test asserts the fix, not the
+	// old behavior it replaced.
+	t.Run("a 429 carries the security headers", func(t *testing.T) {
 		h := newChain(t)
 		r := func() *http.Request {
 			req := httptest.NewRequest(http.MethodGet, "https://"+host+"/", nil)
@@ -239,8 +243,14 @@ func TestMiddlewareOrder(t *testing.T) {
 		if rec.Code != http.StatusTooManyRequests {
 			t.Fatalf("status = %d, want 429", rec.Code)
 		}
-		if rec.Header().Get("Content-Security-Policy") != "" {
-			t.Error("a 429 now carries security headers; the API doc says it does not and must be updated")
+		if rec.Header().Get("Content-Security-Policy") == "" {
+			t.Error("a 429 was written without a Content-Security-Policy header; security headers must run outermost")
+		}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Error("a 429 was written without X-Content-Type-Options: nosniff")
+		}
+		if rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Error("a 429 was written without Strict-Transport-Security")
 		}
 	})
 }
