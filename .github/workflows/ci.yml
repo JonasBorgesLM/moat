@@ -83,7 +83,7 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
 
       - name: Upload coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.module == '.' && 'core' || matrix.module }}
           path: ${{ matrix.module }}/coverage.out
@@ -225,7 +225,7 @@ jobs:
       # the runner. Keeping it means the failing input can be added as a seed.
       - name: Upload any crashers
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashers
           path: "**/testdata/fuzz/**"
