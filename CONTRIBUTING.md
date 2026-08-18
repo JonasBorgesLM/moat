@@ -182,6 +182,52 @@ go test -fuzz=FuzzResolve -fuzztime=60s ./pathguard
 
 Add any input that finds a bug to `testdata/fuzz/` as a seed.
 
+## Review checklist
+
+Two bugs were found and fixed during initial implementation, in places no fuzz
+target covers. Both are the kind of thing that is obvious once flagged and
+easy to reintroduce by copy-paste without a reviewer having seen the original
+finding. Check for both, on every PR that touches the relevant code:
+
+- **TTL-based eviction must never fire before a bucket's next scheduled
+  refill.** The bug: `ratelimit.MemoryStore` originally expired an idle bucket
+  after a flat `idleTTL`, with no floor at how long the bucket actually takes
+  to refill. A throttled client could wait out the TTL and get a fresh
+  allowance before it had genuinely earned one — a rate-limit bypass reachable
+  by doing nothing but waiting. Fixed by taking the cutoff as
+  `max(idleTTL, refillWindow)` in both `ratelimit.MemoryStore.reclaim` and
+  `redisstore.Store.ttlMillis`; regression-tested by
+  `TestMemoryStoreDoesNotForgetUnrefilledBuckets` and
+  `TestTTLCoversTheRefillWindow` respectively.
+
+  **If a PR adds or touches any Store implementation, cache, or other
+  structure with TTL-based expiry:** confirm by inspection that eviction
+  cannot fire before whatever state it holds would naturally have reset or
+  refilled on its own — and if there is no such natural reset (a plain cache,
+  not a rate limiter), confirm that expiring early is actually harmless for
+  that data before waving it through. There is no fuzz target for this and
+  none is planned — it is a property about scheduling relative to
+  configuration, not about input shape — so this is a human read of the
+  eviction logic, every time, not a one-time fix.
+
+- **Every `http.Server` needs `ReadHeaderTimeout`, `ReadTimeout`,
+  `WriteTimeout`, and `IdleTimeout`.** The bug: a `redisstore` doc example used
+  bare `http.ListenAndServe` with no timeouts at all — the exact anti-pattern
+  `examples/basic` has a comment warning against, in the same repository.
+  net/http sets none of these by default; without them a slow client holds a
+  connection open indefinitely, which is a denial of service no middleware in
+  this library can see or prevent.
+
+  CI's `gosec` step already catches the two most common shapes of the missing
+  half of this — `G114` for a bare `http.ListenAndServe`/`ListenAndServeTLS`
+  call, `G112` for an `&http.Server{}` literal with no `ReadHeaderTimeout` — so
+  a PR that omits `ReadHeaderTimeout` entirely will fail CI on its own.
+  **`ReadTimeout`, `WriteTimeout`, and `IdleTimeout` are not checked by
+  anything.** When reviewing a PR that adds or edits an `http.Server` or a call
+  to `http.ListenAndServe`/`ListenAndServeTLS` anywhere in the repo — most
+  likely in `examples/`, but check `redisstore`'s doc examples too — confirm
+  all four are set, not just the one gosec would have caught for you.
+
 ## Design changes
 
 [`doc/DESIGN.md`](./doc/DESIGN.md) is the authoritative record of what the

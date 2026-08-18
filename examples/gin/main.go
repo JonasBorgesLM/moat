@@ -82,6 +82,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	log.Println("listening on", srv.Addr)
 	log.Fatal(srv.ListenAndServe())
