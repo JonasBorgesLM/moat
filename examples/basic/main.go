@@ -33,12 +33,14 @@ import (
 )
 
 func main() {
-	secret, err := loadSecret()
+	// Named key, not secret: naming a local after an imported package shadows
+	// it for the rest of the scope. See CONTRIBUTING.md's review checklist.
+	key, err := loadSecret()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	handler, cleanup, err := newServer(secret, "./public")
+	handler, cleanup, err := newServer(key, "./public")
 	if err != nil {
 		log.Fatal(err)
 	}

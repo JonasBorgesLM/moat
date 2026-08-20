@@ -228,6 +228,25 @@ finding. Check for both, on every PR that touches the relevant code:
   likely in `examples/`, but check `redisstore`'s doc examples too — confirm
   all four are set, not just the one gosec would have caught for you.
 
+- **Example and documentation code must never name a variable after an imported
+  package.** The bug: `secret, err := loadSecret()` in a file that imports
+  `moat/secret`. It compiles, because the shadow only bites if the package is
+  referenced later in the same scope — so the compiler, `go vet`, `staticcheck`
+  and `gosec` all stay silent, and the snippet ships. It surfaced four separate
+  times in one release cycle (`examples/echo`, `examples/gin`, `examples/basic`,
+  and a README snippet), each time found by hand rather than by tooling, and the
+  README one did not compile at all when it was finally extracted and built.
+
+  This matters more in example code than in library code because examples are
+  copied. A reader who pastes `secret, err := ...` into a file that goes on to
+  call `secret.New` gets a confusing compile error in *their* code, not ours.
+
+  **On any PR touching `examples/`, a doc comment, or the README:** check that
+  no local variable, parameter, or short-variable declaration shares a name with
+  an imported package. `key` for a `secret.Value`, `rl` for a limiter, `v` for a
+  `validate` result. Struct fields are fine — `p.secret` is reachable only
+  through its receiver and shadows nothing — so do not "fix" those.
+
 ## Design changes
 
 [`doc/DESIGN.md`](./doc/DESIGN.md) is the authoritative record of what the

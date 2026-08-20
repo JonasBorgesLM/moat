@@ -9,6 +9,13 @@ change to upgrade.
 This project is pre-1.0. Breaking changes may occur in a minor release, which is
 what v0 signals — see `doc/DESIGN.md` §8.
 
+## Unreleased
+
+- Example code no longer names a local variable after an imported package
+  (`examples/basic`). Added to the review checklist in `CONTRIBUTING.md`.
+- Private vulnerability reporting enabled on the repository, so the channel
+  `SECURITY.md` documents is actually usable by a third-party reporter.
+
 ## redisstore/v0.2.1
 
 **`redisstore/v0.2.0` is retracted. Upgrade to v0.2.1.**
