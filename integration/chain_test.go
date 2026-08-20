@@ -39,12 +39,12 @@ type harness struct {
 func newHarness(t *testing.T, cfg preset.Config) *harness {
 	t.Helper()
 
-	if cfg.CSRFSecret == nil && !cfg.DisableCSRF {
-		secret, err := csrf.GenerateSecret()
+	if cfg.CSRFSecret.IsZero() && !cfg.DisableCSRF {
+		key, err := csrf.GenerateSecret()
 		if err != nil {
 			t.Fatal(err)
 		}
-		cfg.CSRFSecret = secret
+		cfg.CSRFSecret = key
 	}
 
 	chain, err := preset.API(cfg)
@@ -166,7 +166,7 @@ func (h *harness) token() string {
 // TestFullFlow walks the sequence a browser performs, over a real connection
 // with a real cookie jar.
 func TestFullFlow(t *testing.T) {
-	h := newHarness(t, preset.Config{RateLimitBurst: 50, RateLimitPerSec: 50})
+	h := newHarness(t, preset.Config{RateLimitBurst: 50, RateLimitPerSec: 50, DirectlyExposed: true})
 
 	// 1. GET issues the cookie and the token.
 	resp, token := h.get("/form")
@@ -217,7 +217,7 @@ func TestFullFlow(t *testing.T) {
 // TestCrossOriginPostIsRejected is the attack the whole CSRF layer exists for:
 // a valid token replayed from another origin.
 func TestCrossOriginPostIsRejected(t *testing.T) {
-	h := newHarness(t, preset.Config{RateLimitBurst: 50, RateLimitPerSec: 50})
+	h := newHarness(t, preset.Config{RateLimitBurst: 50, RateLimitPerSec: 50, DirectlyExposed: true})
 	token := h.token()
 
 	body := url.Values{csrf.DefaultFieldName: {token}, "amount": {"100"}}.Encode()
@@ -237,7 +237,7 @@ func TestCrossOriginPostIsRejected(t *testing.T) {
 // TestSecurityHeadersOnEveryResponse checks the headers survive the round trip
 // on success and on the failures the middleware itself writes.
 func TestSecurityHeadersOnEveryResponse(t *testing.T) {
-	h := newHarness(t, preset.Config{RateLimitBurst: 50, RateLimitPerSec: 50})
+	h := newHarness(t, preset.Config{RateLimitBurst: 50, RateLimitPerSec: 50, DirectlyExposed: true})
 	token := h.token()
 
 	required := []string{
@@ -275,6 +275,7 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 func TestRateLimitOverTheWire(t *testing.T) {
 	const burst = 3
 	h := newHarness(t, preset.Config{
+		DirectlyExposed: true,
 		DisableCSRF:     true,
 		RateLimitBurst:  burst,
 		RateLimitPerSec: 0.01, // slow enough that nothing refills mid-test
@@ -328,6 +329,7 @@ func TestRateLimitOverTheWire(t *testing.T) {
 func TestOversizedBodyIsRejected(t *testing.T) {
 	const limit = 512
 	h := newHarness(t, preset.Config{
+		DirectlyExposed: true,
 		DisableCSRF:     true,
 		RateLimitBurst:  50,
 		RateLimitPerSec: 50,
@@ -379,6 +381,7 @@ func TestOversizedBodyIsRejected(t *testing.T) {
 // directly, since net/http normalizes some of them before the handler sees them.
 func TestTraversalOverTheWire(t *testing.T) {
 	h := newHarness(t, preset.Config{
+		DirectlyExposed: true,
 		DisableCSRF:     true,
 		RateLimitBurst:  100,
 		RateLimitPerSec: 100,

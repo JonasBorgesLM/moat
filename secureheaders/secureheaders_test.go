@@ -1,9 +1,11 @@
 package secureheaders_test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -345,4 +347,473 @@ func ExampleWithHSTS() {
 
 	fmt.Println(rec.Header().Get("Strict-Transport-Security"))
 	// Output: max-age=31536000; includeSubDomains; preload
+}
+
+// --- CSP nonce ---------------------------------------------------------------
+
+// nonceFrom extracts the nonce source from a rendered policy, so tests can
+// assert on it without hard-coding a random value.
+func nonceFrom(t *testing.T, policy string) string {
+	t.Helper()
+	i := strings.Index(policy, "'nonce-")
+	if i < 0 {
+		t.Fatalf("no nonce in policy %q", policy)
+	}
+	rest := policy[i+len("'nonce-"):]
+	j := strings.Index(rest, "'")
+	if j < 0 {
+		t.Fatalf("unterminated nonce in policy %q", policy)
+	}
+	return rest[:j]
+}
+
+// run drives one request through an already-built middleware, which the nonce
+// tests need because they inspect what the handler saw as well as the response.
+func run(t *testing.T, mw func(http.Handler) http.Handler, h http.Handler) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	mw(h).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	return rec
+}
+
+func TestNonceIsInjectedAndReadable(t *testing.T) {
+	var seen string
+	var ok bool
+	rec := run(t, secureheaders.Middleware(secureheaders.WithNonce()),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen, ok = secureheaders.Nonce(r)
+		}))
+
+	if !ok {
+		t.Fatal("Nonce reported no value inside a nonce-enabled middleware")
+	}
+	policy := rec.Header().Get("Content-Security-Policy")
+	if got := nonceFrom(t, policy); got != seen {
+		t.Errorf("policy nonce %q != handler nonce %q", got, seen)
+	}
+	if !strings.Contains(policy, "script-src 'nonce-"+seen+"'") {
+		t.Errorf("policy = %q, want script-src carrying the nonce", policy)
+	}
+}
+
+// TestNonceIsUniquePerRequest is the property the whole mechanism rests on: a
+// reused nonce is a nonce an attacker can learn from one response and replay
+// into an injection on the next.
+func TestNonceIsUniquePerRequest(t *testing.T) {
+	mw := secureheaders.Middleware(secureheaders.WithNonce())
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+
+	seen := make(map[string]bool, 200)
+	for i := range 200 {
+		n := nonceFrom(t, run(t, mw, h).Header().Get("Content-Security-Policy"))
+		if seen[n] {
+			t.Fatalf("nonce %q repeated on request %d", n, i)
+		}
+		seen[n] = true
+
+		// It must also be long enough to be unguessable.
+		raw, err := base64.StdEncoding.DecodeString(n)
+		if err != nil {
+			t.Fatalf("nonce %q is not standard base64: %v", n, err)
+		}
+		if len(raw) < 16 {
+			t.Errorf("nonce carries %d bytes, want at least 16", len(raw))
+		}
+	}
+}
+
+// TestNonceAddsAnAbsentDirective is the reason a missing script-src cannot
+// produce a silently broken policy: DefaultCSP has no script-src at all.
+func TestNonceAddsAnAbsentDirective(t *testing.T) {
+	if strings.Contains(secureheaders.DefaultCSP, "script-src") {
+		t.Skip("DefaultCSP now has a script-src; this test needs rewriting")
+	}
+	policy := run(t, secureheaders.Middleware(secureheaders.WithNonce()),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).
+		Header().Get("Content-Security-Policy")
+
+	if !strings.Contains(policy, "script-src 'nonce-") {
+		t.Errorf("policy = %q, want an added script-src", policy)
+	}
+	// The rest of the policy must survive intact.
+	for _, want := range []string{"default-src 'self'", "frame-ancestors 'none'", "object-src 'none'"} {
+		if !strings.Contains(policy, want) {
+			t.Errorf("policy = %q, lost %q", policy, want)
+		}
+	}
+}
+
+func TestNonceJoinsAnExistingDirective(t *testing.T) {
+	mw := secureheaders.Middleware(
+		secureheaders.WithCSP("default-src 'self'; script-src 'self' https://cdn.example.com; style-src 'self'"),
+		secureheaders.WithNonce("script-src", "style-src"),
+	)
+	policy := run(t, mw, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).
+		Header().Get("Content-Security-Policy")
+	n := nonceFrom(t, policy)
+
+	if !strings.Contains(policy, "script-src 'self' https://cdn.example.com 'nonce-"+n+"'") {
+		t.Errorf("policy = %q, want the nonce appended to the existing script-src sources", policy)
+	}
+	if !strings.Contains(policy, "style-src 'self' 'nonce-"+n+"'") {
+		t.Errorf("policy = %q, want the nonce appended to style-src", policy)
+	}
+	if strings.Count(policy, "script-src") != 1 {
+		t.Errorf("policy = %q, script-src was duplicated rather than extended", policy)
+	}
+}
+
+// TestNonceMatchesAcrossBothPolicies: a report-only policy must carry the same
+// nonce as the enforced one, or trialling a policy reports violations that the
+// enforced policy would not have produced.
+func TestNonceInReportOnlyPolicy(t *testing.T) {
+	mw := secureheaders.Middleware(
+		secureheaders.WithCSPReportOnly("default-src 'self'; script-src 'self'"),
+		secureheaders.WithNonce(),
+	)
+	rec := run(t, mw, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	enforced := rec.Header().Get("Content-Security-Policy")
+	report := rec.Header().Get("Content-Security-Policy-Report-Only")
+	if report == "" {
+		t.Fatal("report-only policy is missing")
+	}
+	if nonceFrom(t, enforced) != nonceFrom(t, report) {
+		t.Errorf("the two policies carry different nonces:\n  %s\n  %s", enforced, report)
+	}
+}
+
+// TestNonceIsAbsentWithoutTheOption pins that Nonce follows csrf.Token: no
+// silent empty string when the feature is off.
+func TestNonceIsAbsentWithoutTheOption(t *testing.T) {
+	var ok bool
+	var got string
+	run(t, secureheaders.Middleware(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, ok = secureheaders.Nonce(r)
+	}))
+	if ok || got != "" {
+		t.Errorf("Nonce = %q, %v; want empty and false without WithNonce", got, ok)
+	}
+
+	// And with no middleware at all.
+	if got, ok := secureheaders.Nonce(httptest.NewRequest(http.MethodGet, "/", nil)); ok || got != "" {
+		t.Errorf("Nonce on a bare request = %q, %v; want empty and false", got, ok)
+	}
+	if got, ok := secureheaders.Nonce(nil); ok || got != "" {
+		t.Errorf("Nonce(nil) = %q, %v; want empty and false", got, ok)
+	}
+}
+
+func TestNonceModeStillWritesTheOtherHeaders(t *testing.T) {
+	rec := run(t, secureheaders.Middleware(secureheaders.WithNonce()),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	for _, h := range []string{
+		"Strict-Transport-Security", "X-Frame-Options",
+		"X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy",
+	} {
+		if rec.Header().Get(h) == "" {
+			t.Errorf("%s is missing in nonce mode", h)
+		}
+	}
+	if n := len(rec.Header().Values("Content-Security-Policy")); n != 1 {
+		t.Errorf("Content-Security-Policy appears %d times, want 1", n)
+	}
+}
+
+func TestWithoutCSPAndNonce(t *testing.T) {
+	// Nonces with no policy to inject into: the nonce is still issued (a
+	// handler may render it), but no CSP header is invented.
+	var ok bool
+	rec := run(t, secureheaders.Middleware(secureheaders.WithoutCSP(), secureheaders.WithNonce()),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, ok = secureheaders.Nonce(r)
+		}))
+	if !ok {
+		t.Error("no nonce was issued")
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != "" {
+		t.Errorf("Content-Security-Policy = %q, want it absent after WithoutCSP", got)
+	}
+}
+
+func TestWithNonceIgnoresEmptyAndDuplicateDirectives(t *testing.T) {
+	mw := secureheaders.Middleware(
+		secureheaders.WithCSP("default-src 'self'"),
+		secureheaders.WithNonce("script-src", "", "  ", "SCRIPT-SRC"),
+	)
+	policy := run(t, mw, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).
+		Header().Get("Content-Security-Policy")
+
+	if strings.Count(policy, "script-src") != 1 {
+		t.Errorf("policy = %q, want exactly one script-src", policy)
+	}
+}
+
+// --- Cache-Control -----------------------------------------------------------
+
+func TestNoStore(t *testing.T) {
+	rec := httptest.NewRecorder()
+	secureheaders.NoStore(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/token", nil))
+
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store (RFC 6749 §5.1)", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q, want no-cache (RFC 6749 §5.1)", got)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want the wrapped handler's 200", rec.Code)
+	}
+}
+
+// TestNoStoreSetsHeadersBeforeTheHandler: a handler that writes its status
+// immediately must not lose the headers.
+func TestNoStoreSetsHeadersBeforeTheHandler(t *testing.T) {
+	rec := httptest.NewRecorder()
+	secureheaders.NoStore(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/token", nil))
+
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q; the headers were written too late", got)
+	}
+}
+
+// TestNoStoreIsOverridable keeps the package's stated contract that a handler
+// may replace any header this package sets.
+func TestNoStoreIsOverridable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	secureheaders.NoStore(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=60")
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/public", nil))
+
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=60" {
+		t.Errorf("Cache-Control = %q, want the handler's value", got)
+	}
+}
+
+// --- Clear-Site-Data ---------------------------------------------------------
+
+func TestClearSiteData(t *testing.T) {
+	tests := []struct {
+		name  string
+		types []secureheaders.SiteDataType
+		want  string
+	}{
+		{
+			name: "the default is cache, cookies and storage",
+			want: `"cache", "cookies", "storage"`,
+		},
+		{
+			name:  "an explicit selection is used as given",
+			types: []secureheaders.SiteDataType{secureheaders.SiteDataCookies},
+			want:  `"cookies"`,
+		},
+		{
+			name: "executionContexts is available on request",
+			types: []secureheaders.SiteDataType{
+				secureheaders.SiteDataCookies, secureheaders.SiteDataExecutionContexts,
+			},
+			want: `"cookies", "executionContexts"`,
+		},
+		{
+			name:  "the wildcard is passed through",
+			types: []secureheaders.SiteDataType{secureheaders.SiteDataAll},
+			want:  `"*"`,
+		},
+		{
+			name: "duplicates and blanks are dropped",
+			types: []secureheaders.SiteDataType{
+				secureheaders.SiteDataCookies, "", "  ", secureheaders.SiteDataCookies,
+			},
+			want: `"cookies"`,
+		},
+		{
+			name:  "an entirely empty selection falls back to the default",
+			types: []secureheaders.SiteDataType{"", "   "},
+			want:  `"cache", "cookies", "storage"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			secureheaders.ClearSiteData(tc.types...)(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusNoContent)
+				})).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", nil))
+
+			if got := rec.Header().Get("Clear-Site-Data"); got != tc.want {
+				t.Errorf("Clear-Site-Data = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClearSiteDataValuesAreQuoted pins the one detail that makes the header
+// work at all: an unquoted value is ignored by browsers, so the middleware
+// would silently do nothing.
+func TestClearSiteDataValuesAreQuoted(t *testing.T) {
+	rec := httptest.NewRecorder()
+	secureheaders.ClearSiteData()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).
+		ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", nil))
+
+	value := rec.Header().Get("Clear-Site-Data")
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, `"`) || !strings.HasSuffix(part, `"`) {
+			t.Errorf("entry %q is not quoted; browsers ignore unquoted values (full header %q)", part, value)
+		}
+	}
+}
+
+// TestClearSiteDataSurvivesARedirect covers the shape a real logout has: the
+// handler redirects, and the header must be on the redirect response itself
+// because the browser will not carry it to the destination.
+func TestClearSiteDataSurvivesARedirect(t *testing.T) {
+	rec := httptest.NewRecorder()
+	secureheaders.ClearSiteData()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", nil))
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rec.Code)
+	}
+	if rec.Header().Get("Clear-Site-Data") == "" {
+		t.Error("the header was lost on the redirect response")
+	}
+}
+
+func ExampleClearSiteData() {
+	logout := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Invalidate the session server-side first. Clear-Site-Data is defense
+		// in depth: it is ignored on plaintext origins and support is uneven,
+		// so a logout must never depend on it.
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("POST /logout", secureheaders.ClearSiteData()(logout))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/logout", nil))
+
+	fmt.Println(rec.Header().Get("Clear-Site-Data"))
+	// Output: "cache", "cookies", "storage"
+}
+
+// --- Cross-origin isolation headers ------------------------------------------
+
+// TestCrossOriginHeadersAreNotDefaults is the load-bearing test for this group.
+// The library is published; adding any of these three to the default set would
+// change behaviour for every already-deployed consumer with no compile error to
+// warn them, and each has a documented breakage mode. If a default is ever
+// added deliberately, this test fails and forces the change to be a decision.
+func TestCrossOriginHeadersAreNotDefaults(t *testing.T) {
+	rec, _ := serve(t)
+	for _, h := range []string{
+		"Cross-Origin-Opener-Policy",
+		"Cross-Origin-Resource-Policy",
+		"Cross-Origin-Embedder-Policy",
+	} {
+		if got := rec.Header().Get(h); got != "" {
+			t.Errorf("%s = %q by default; changing a default in a published security "+
+				"library breaks consumers silently -- see DESIGN.md §4.4", h, got)
+		}
+	}
+}
+
+func TestCrossOriginOptions(t *testing.T) {
+	tests := []struct {
+		name   string
+		opt    secureheaders.Option
+		header string
+		want   string
+	}{
+		{
+			name:   "COOP same-origin-allow-popups",
+			opt:    secureheaders.WithCrossOriginOpenerPolicy(secureheaders.COOPSameOriginAllowPopups),
+			header: "Cross-Origin-Opener-Policy",
+			want:   "same-origin-allow-popups",
+		},
+		{
+			name:   "COOP same-origin",
+			opt:    secureheaders.WithCrossOriginOpenerPolicy(secureheaders.COOPSameOrigin),
+			header: "Cross-Origin-Opener-Policy",
+			want:   "same-origin",
+		},
+		{
+			name:   "CORP same-origin",
+			opt:    secureheaders.WithCrossOriginResourcePolicy(secureheaders.CORPSameOrigin),
+			header: "Cross-Origin-Resource-Policy",
+			want:   "same-origin",
+		},
+		{
+			name:   "CORP cross-origin for a public asset",
+			opt:    secureheaders.WithCrossOriginResourcePolicy(secureheaders.CORPCrossOrigin),
+			header: "Cross-Origin-Resource-Policy",
+			want:   "cross-origin",
+		},
+		{
+			name:   "COEP require-corp",
+			opt:    secureheaders.WithCrossOriginEmbedderPolicy(secureheaders.COEPRequireCorp),
+			header: "Cross-Origin-Embedder-Policy",
+			want:   "require-corp",
+		},
+		{
+			name:   "COEP credentialless",
+			opt:    secureheaders.WithCrossOriginEmbedderPolicy(secureheaders.COEPCredentialless),
+			header: "Cross-Origin-Embedder-Policy",
+			want:   "credentialless",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, _ := serve(t, tc.opt)
+			if got := rec.Header().Get(tc.header); got != tc.want {
+				t.Errorf("%s = %q, want %q", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCrossOriginEmptyValueOmitsTheHeader covers passing a zero value, which
+// must mean "do not send" rather than sending an empty header a browser would
+// treat as invalid.
+func TestCrossOriginEmptyValueOmitsTheHeader(t *testing.T) {
+	rec, _ := serve(t,
+		secureheaders.WithCrossOriginOpenerPolicy(""),
+		secureheaders.WithCrossOriginResourcePolicy(""),
+		secureheaders.WithCrossOriginEmbedderPolicy(""),
+	)
+	for _, h := range []string{
+		"Cross-Origin-Opener-Policy",
+		"Cross-Origin-Resource-Policy",
+		"Cross-Origin-Embedder-Policy",
+	} {
+		if _, ok := rec.Header()[h]; ok {
+			t.Errorf("%s was sent for an empty value", h)
+		}
+	}
+}
+
+// TestCORPCanBeOverriddenPerRoute documents the escape hatch for the mixed
+// case: a strict chain-wide CORP with public assets served through it.
+func TestCORPCanBeOverriddenPerRoute(t *testing.T) {
+	mw := secureheaders.Middleware(
+		secureheaders.WithCrossOriginResourcePolicy(secureheaders.CORPSameOrigin))
+
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cross-Origin-Resource-Policy", string(secureheaders.CORPCrossOrigin))
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/avatar.png", nil))
+
+	if got := rec.Header().Get("Cross-Origin-Resource-Policy"); got != "cross-origin" {
+		t.Errorf("Cross-Origin-Resource-Policy = %q, want the handler's value", got)
+	}
 }

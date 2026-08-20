@@ -7,6 +7,8 @@ module github.com/JonasBorgesLM/moat/examples
 
 go 1.25.0
 
+toolchain go1.26.6
+
 require (
 	github.com/JonasBorgesLM/moat v0.1.0
 	github.com/gin-gonic/gin v1.12.0

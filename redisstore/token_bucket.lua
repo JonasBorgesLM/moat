@@ -13,25 +13,39 @@
 -- linted, read with syntax highlighting, and run directly against a server
 -- while debugging:
 --
---   redis-cli --eval token_bucket.lua ratelimit:1.2.3.4 , 20 5 1700000000000 60000
+--   redis-cli --eval token_bucket.lua ratelimit:1.2.3.4 , 20 5 1700000000000 60000 1
 --
 -- KEYS[1] -- the bucket key.
 -- ARGV[1] -- burst: bucket capacity, in tokens.
 -- ARGV[2] -- rate: tokens replenished per second. Zero means never.
 -- ARGV[3] -- now_ms: caller's clock, in milliseconds since the epoch.
 -- ARGV[4] -- ttl_ms: how long to keep the bucket after this call.
+-- ARGV[5] -- cost: tokens this call consumes. At least 1.
+--
+-- The cost is deducted here rather than by calling this script `cost` times,
+-- because the whole point of running in Redis is that read, refill, decide and
+-- write-back are one indivisible step. Looping would reintroduce exactly the
+-- interleaving described above, and would also allow a partial deduction: a
+-- caller charged for three of five tokens and then denied has paid for work it
+-- was not allowed to do.
 --
 -- Returns {allowed, remaining, retry_after_ms}:
---   allowed        1 if a token was consumed, 0 if not.
+--   allowed        1 if the full cost was consumed, 0 if not.
 --   remaining      whole tokens left after this call.
---   retry_after_ms milliseconds until a token is available; 0 if one is
---                  available now, -1 if the bucket never refills.
+--   retry_after_ms milliseconds until the caller may proceed; 0 if it may now,
+--                  -1 if the bucket never refills.
 
 local key    = KEYS[1]
 local burst  = tonumber(ARGV[1])
 local rate   = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
 local ttl_ms = tonumber(ARGV[4])
+local cost   = tonumber(ARGV[5])
+
+-- A cost below 1 would let a miscomputed weight buy a free request.
+if cost == nil or cost < 1 then
+  cost = 1
+end
 
 -- State is one hash rather than two keys: it expires as a unit, it is written
 -- as a unit, and in cluster mode it lives in a single slot.
@@ -62,18 +76,33 @@ if tokens < 0 then
   tokens = 0
 end
 
+-- All of the cost or none of it. A cost above burst can never be met, which is
+-- a denial rather than an error: the bucket simply cannot hold that much.
 local allowed = 0
-if tokens >= 1 then
+if tokens >= cost then
   allowed = 1
-  tokens = tokens - 1
+  tokens = tokens - cost
+end
+
+-- How many tokens the caller still needs before it may proceed. After a
+-- successful take that is one token, for the next single request; after a
+-- denial it is the remainder of this call's cost, so a client that comes back
+-- at the advertised time is not rejected a second time.
+local needed = 0
+if allowed == 1 then
+  if tokens < 1 then
+    needed = 1 - tokens
+  end
+else
+  needed = cost - tokens
 end
 
 local retry_ms = 0
-if tokens < 1 then
+if needed > 0 then
   if rate > 0 then
     -- Round up. Advertising a retry time at which the token is not yet
     -- available just invites the client back into another rejection.
-    retry_ms = math.ceil(((1 - tokens) / rate) * 1000)
+    retry_ms = math.ceil((needed / rate) * 1000)
     if retry_ms < 1 then
       retry_ms = 1
     end
@@ -92,4 +121,6 @@ redis.call('HSET', key, 't', tostring(tokens), 'ts', tostring(now_ms))
 -- refilled -- dropping one early resets its client's allowance.
 redis.call('PEXPIRE', key, ttl_ms)
 
-return {allowed, math.floor(tokens), retry_ms}
+-- math.max guards the floor against a negative remainder, which cannot happen
+-- with the clamp above but would be a silent contract violation if it did.
+return {allowed, math.max(0, math.floor(tokens)), retry_ms}

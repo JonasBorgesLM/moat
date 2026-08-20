@@ -83,6 +83,36 @@ silently and become wrong advice — which for a security library is worse than 
 advice. Putting them in their own module means they are real, CI-verified code
 without leaking `gin`/`echo` into the core `go.sum`.
 
+### Why there is no `moat/jwtauth` — a decision, not an omission
+
+**Decided: not extracting. Deferred until the criterion below is met.** This is
+recorded so that the question is not reopened from scratch every time someone
+notices JWT validation is missing from a library that otherwise covers the
+request edge.
+
+The criterion for extracting anything into this repository is that **the
+signature has stabilized under real use**, measured two ways: how many times it
+changed over the consumer's last few iterations, and whether a second consumer
+besides the originating one has informed the design. A shape that is still moving
+is a shape nobody has finished learning, and publishing it converts every
+remaining lesson into a breaking change.
+
+`jwtauth` fails that criterion by a wide margin, and not marginally on one leg of
+it — it has no measurements at all. The authentication gateway that would be its
+first consumer is still in requirements and has no code. The local
+`pkg/tokenvalidator` that was supposed to accumulate the usage experience does
+not exist either, so there is no signature to have stabilized and no change count
+to take. Extracting now would mean designing a library against an imagined
+consumer, which is precisely what the original plan refused to do — and doing it
+for token validation, where getting the shape wrong is not merely awkward.
+
+**Re-evaluate when, and only when:** the gateway has a validator in real use;
+its signature has gone some meaningful stretch of that consumer's iterations
+without changing; and there is either a second consumer or a concrete reason to
+believe the first one's needs generalize. Until all three hold, the answer here
+stays no, and the absence of a `moat/jwtauth` is the plan working rather than
+something left undone.
+
 ---
 
 ## 3. Core abstractions
@@ -162,6 +192,156 @@ Two hard rules, both consequences of the audit (§6.2):
 the true analogue of calling `helmet()` bare — and is honest about being only
 that.
 
+### 3.4 Invariant: every middleware that can reject a request exposes a customizable handler
+
+**Any middleware in this library that can refuse a request must let the
+application replace the response it writes.**
+
+The reason is not aesthetic. An application publishes one error contract — say
+the `{"error": ...}` envelope in its `openapi.yaml` — and clients are written
+against it. A middleware that answers with `net/http`'s `text/plain` breaks that
+contract on exactly the routes where a protection fired, which is to say on the
+routes where the client most needs a parseable answer. Worse, it breaks it
+*inconsistently*: the same client gets the documented shape from every handler
+and an undocumented one from the rate limiter, so the failure looks like a bug
+in the client's own error handling.
+
+Three rules follow, and each has cost a real inconsistency here:
+
+1. **Every rejection point, not every middleware.** A component with two ways to
+   say no needs two handlers. `pathguard.FileServer` had a 404 and a 405;
+   exposing only the 404 would have swapped one inconsistency for another inside
+   a single handler.
+2. **Distinct causes get distinct handlers when the status differs.**
+   `ratelimit` separates `WithDeniedHandler` (429) from `WithStoreErrorHandler`
+   (503) because answering an outage with 429 makes it indistinguishable from
+   real throttling. Merging them would be a monitoring failure, not just a
+   formatting one.
+3. **Customizable does not mean informative.** A replacement inherits the
+   original's discretion. `pathguard`'s 404 stays identical across every cause
+   or it becomes a filesystem-mapping oracle again (§4.6); `csrf`'s 403 must not
+   say *why* verification failed. The doc comment on each option states what the
+   replacement must not reveal.
+
+#### The audit against this invariant — closed
+
+Every response-writing site in the library was swept (`http.Error`,
+`http.NotFound`, `WriteHeader`, `Redirect`, `w.Write`), and re-swept after the
+hooks landed and after `secureheaders` gained a rejection point of its own.
+
+**Status: closed for all known cases.** Every rejection point in the eleven core
+packages routes through an unexported `write*` helper that dispatches to a
+configurable handler and falls back to the built-in response, and every option
+follows the same convention: `func(h http.Handler) Option`, nil ignored.
+
+| Package | Rejection points | Hook | Origin |
+|---|---|---|---|
+| `ratelimit` | 429 denial | `WithDeniedHandler` | pre-existing |
+| `ratelimit` | 503 store outage | `WithStoreErrorHandler` | pre-existing |
+| `csrf` | 403 verification failure | `WithErrorHandler` | pre-existing |
+| `pathguard` | 404, all causes | `WithNotFoundHandler` | **found by the audit** |
+| `pathguard` | 405 wrong method | `WithMethodNotAllowedHandler` | **found by the audit** |
+| `validate` | 415 content type | `WithContentTypeErrorHandler` | **found by the audit** |
+| `validate` | 413 declared length | `WithMaxBodyErrorHandler` | **found by the audit** |
+| `secureheaders` | 500 CSPRNG failure | `WithNonceErrorHandler` | added with the feature (§4.4) |
+| `sanitize`, `middleware`, `realip`, `secret` | none | — | never refuse a request |
+| `preset` | none of its own | passes `HeaderOptions`, `CSRFOptions`, `RateLimitOptions` and `BodyLimitOptions` through | **`BodyLimitOptions` found by the coherence sweep** |
+| `redisstore` | none | — | not an HTTP component |
+
+The two the audit found are the ones worth remembering, because both were
+*second* rejection points in a component that already had one and therefore
+looked covered from a distance: `pathguard`'s 405 sat behind its 404, and
+`validate`'s 413 header pre-check sat behind its `MaxBytesReader` path. The
+lesson encoded in rule 1 above — every rejection *point*, not every middleware —
+came from these two.
+
+`secureheaders` is the invariant working prospectively rather than
+retroactively: CSP nonces introduced the package's first-ever rejection point,
+and it shipped with its hook rather than acquiring one in a later audit.
+
+#### The invariant has a second layer: `preset`
+
+A hook that exists on a package but cannot be reached through `preset` satisfies
+the letter of the invariant and defeats its purpose. `preset` exists for
+one-call adoption, and one-call adoption must not cost the caller something that
+wiring the packages by hand would have given them.
+
+A sweep of what `preset.API` actually wires found exactly one gap. It composes
+four middlewares:
+
+| Wired | Hook | Reachable via |
+|---|---|---|
+| `secureheaders.Middleware` | `WithNonceErrorHandler` | `HeaderOptions` |
+| `ratelimit.New` | `WithDeniedHandler`, `WithStoreErrorHandler` | `RateLimitOptions` |
+| `validate.MaxBodyBytes` | `WithMaxBodyErrorHandler` | **was unreachable** — `BodyLimitOptions` added |
+| `csrf.New` | `WithErrorHandler` | `CSRFOptions` |
+
+The consequence of the gap was precise and exactly the thing §3.4 exists to
+prevent: an application with a JSON error envelope got that envelope from the
+rate limiter, the store-outage path and the CSRF check, and `text/plain` from
+the 413 — one inconsistent route out of four, introduced by the very component
+whose job is coherent adoption.
+
+`pathguard.FileServer` and `validate.RequireContentType` are not wired by any
+preset, so their hooks have nothing to be reachable *through*; that is absence,
+not a gap.
+
+`TestEveryRejectionHookIsReachableThroughThePreset` drives all four rejections
+through a preset-built chain and requires the caller's envelope on each, so this
+layer cannot silently regress. Verified by removal: dropping the passthrough
+fails it on the 413.
+
+#### The one place the invariant is satisfied by two mechanisms
+
+`validate.MaxBodyBytes` refuses an oversized request in two places, and only one
+of them can be an Option:
+
+- The **declared** `Content-Length` is over the limit. The middleware answers
+  itself, so `WithMaxBodyErrorHandler` covers it.
+- The client **lied or declared nothing**. Nothing is known until the body is
+  read, and by then the middleware has returned. The failure surfaces as a
+  `*http.MaxBytesError` from the handler's `Read`, and is mapped downstream with
+  `errors.As`.
+
+Making the second path write its own response was rejected: a middleware that is
+no longer on the stack would be racing a handler that may already have sent
+headers. Deleting the first path's response instead — letting the header check
+merely shorten the body so the reader always fires — was also rejected, because
+it gives up refusing an oversized upload *before* reading it, which is the whole
+point of checking the header.
+
+So the invariant is met by two mechanisms with one *observable result*, and the
+distinction matters enough to state precisely: the two paths do **not** pass
+through the same configured handler, and cannot. The reader path surfaces after
+the middleware has returned from the stack, so there is nothing left to dispatch
+to. What is identical is what the client sees, and only if the adopter wires
+both — which is why the doc comment presents them as one two-part task rather
+than as an option plus a footnote, and why `ExampleMaxBodyBytes` shows both
+producing byte-identical output.
+
+`TestWithMaxBodyErrorHandlerDoesNotCoverTheReaderPath` pins the boundary so the
+documentation cannot drift into claiming the stronger, false version.
+
+A note on what the header check is *not*: it only ever rejects. The
+`MaxBytesReader` wrap is unconditional and always uses the configured limit,
+never the declared length, so a small declared `Content-Length` cannot skip it.
+Making that wrap conditional would turn the optimization into a bypass —
+`TestMaxBodyBytesWrapsTheReaderEvenWhenTheDeclaredLengthPasses` guards it.
+
+#### Cost accepted
+
+`validate.RequireContentType` changed from `(mediaTypes ...string)` to
+`(mediaTypes []string, opts ...ContentTypeOption)`. The variadic was already
+spent on the media types, so options could not be appended without it. Source
+break, taken deliberately under the pre-1.0 policy (§8); the call sites were
+tests and examples only.
+
+`validate` uses two option types, `BodyLimitOption` and `ContentTypeOption`,
+rather than one package-wide `Option`. With a single type, passing a
+content-type option to `MaxBodyBytes` would compile and silently do nothing —
+precisely the class of quiet misconfiguration this library refuses elsewhere.
+`pathguard` has one option type because it has one constructor that takes them.
+
 ---
 
 ## 4. Component design
@@ -182,7 +362,7 @@ type Result struct {
 }
 
 type Store interface {
-    Take(ctx context.Context, key string, cfg Config, now time.Time) (Result, error)
+    TakeN(ctx context.Context, key string, n int, cfg Config, now time.Time) (Result, error)
     Close() error
 }
 ```
@@ -190,6 +370,63 @@ type Store interface {
 `context.Context` is mandatory for any network-backed store (timeouts,
 cancellation, tracing propagation). `error` is mandatory so a backend outage is
 distinguishable from a legitimate denial.
+
+**Why the interface method is `TakeN` and not `Take`.** Weighted cost cannot be
+built on top of a single-token primitive. Calling `Take` n times is exactly the
+read-modify-write interleaving the Lua script exists to prevent, and it also
+admits a *partial* deduction: a caller charged for three of five tokens and then
+denied has paid for work it was not allowed to do. So the count has to reach the
+atomic step, which means it has to be in the interface.
+
+The alternative considered was keeping `Take` and adding `TakeN` as an optional
+interface discovered by type assertion, with `AllowN(n>1)` returning an
+"unsupported" error for stores that lack it. Rejected: it buys source
+compatibility for third-party stores at the price of two code paths, a
+permanently two-method contract, and a runtime failure mode that exists only to
+paper over the split. Under the pre-1.0 policy (§8) the clean break is the
+cheaper answer, and both in-tree stores are ours.
+
+`Take(ctx, key)` survives on the `Limiter` as a wrapper for `TakeN(ctx, key, 1)`
+— one implementation, no drift.
+
+**The callable API.** The limiter was previously reachable only as middleware
+plus a raw `Take`. That is insufficient for the case it is most often wanted in:
+limiting by an identity that is only known *after* authentication — an account,
+an API key, a tenant — which a `KeyFunc` cannot derive from the request. So:
+
+```go
+func (l *Limiter) Allow(ctx, key) bool                 // TakeN(1), failure policy applied
+func (l *Limiter) AllowN(ctx, key string, n int) bool  // weighted, failure policy applied
+func (l *Limiter) Take(ctx, key) (Result, error)       // raw
+func (l *Limiter) TakeN(ctx, key string, n int) (Result, error)
+```
+
+`Allow`/`AllowN` apply the configured `FailureMode` and report to `OnError`;
+`Take`/`TakeN` hand back the error so the caller can decide. That is the entire
+difference, and it is the reason both pairs exist rather than one.
+
+`AllowN` returns a bare `bool` rather than a `Result`. A caller that wants the
+remaining allowance or a retry hint is asking a different question and should
+call `TakeN`, whose answer already carries both; folding them into the common
+case would make every call site carry values it does not use.
+
+**One copy of the failure policy.** The middleware and `AllowN` both route
+through an unexported `evaluate`, which returns a four-state `outcome`
+(allowed / denied / store-error / failed-open) rather than a `(Result, error)`
+pair each caller re-interprets. `failed-open` is deliberately distinct from
+`allowed`: there is no `Result` behind it, so the middleware knows not to
+publish rate-limit headers derived from a zero value — advertising a zeroed
+allowance would tell clients they are throttled when the truth is that no
+decision was made. `TestFailOpenWritesNoRateLimitHeaders` pins it.
+
+**Cost normalization.** `n < 1` is clamped to 1, in the `Limiter` and again in
+every store. A weight that arrives miscomputed — an empty list, a truncating
+integer division — must not produce a request that passes through the limiter
+without paying for itself. `n > Burst` can never be satisfied and is reported as
+a *denial*, not an error: it is a decision about a request that costs more than
+the bucket can ever hold. It must also not drain the bucket on its way to
+refusing, which `TestCostAboveBurstIsDeniedNotErrored` checks against real
+Redis.
 
 **Failure policy:** on store error the middleware **fails closed** (rejects the
 request) and invokes an `OnError func(error)` hook. The library never logs or
@@ -207,10 +444,14 @@ is client-controlled and trivially spoofable. Behind a trusted proxy, supply a
 actually that proxy. This is documented prominently because getting it wrong
 turns rate limiting into a no-op.
 
-**Memory bounds:** `MemoryStore` caps the number of tracked keys and evicts the
-least recently used entry past the cap, in addition to TTL-based cleanup. An
+**Memory bounds:** `MemoryStore` caps the number of tracked keys and discards
+the **most refilled** bucket past the cap, in addition to TTL-based cleanup. An
 unbounded map keyed by client IP is itself a memory-exhaustion vector — a single
 host with an IPv6 /64 can mint effectively unlimited distinct addresses (§6.5).
+The eviction policy is not a detail: discarding a bucket grants its client a
+fresh burst, so the only bucket that is free to discard is one that had already
+refilled. Least-recently-used ordering picks the opposite of that, which is why
+it is gone (§6.12).
 
 **Response headers:** emits both the widely deployed `X-RateLimit-*` headers and
 the standardized `RateLimit-*` form, configurable and disableable — exposing
@@ -227,9 +468,27 @@ share one limit.
   concurrent requests and let clients exceed the limit. The script lives in a
   standalone `.lua` file embedded with `go:embed`, so it can be linted, read with
   syntax highlighting, and debugged directly with `redis-cli --eval`.
+- **Weighted cost inside the same script.** The cost is `ARGV[5]`, so a
+  `TakeN(n)` is still one `EVALSHA`. Deducting `n` by invoking the script `n`
+  times would reintroduce precisely the interleaving the script exists to
+  prevent, and would allow a partial deduction. The script takes all of the cost
+  or none of it.
 - **TTL in Redis** replaces the in-process janitor.
 - **Fail-closed** on connection error or timeout, per §4.1.
 - Depends on `github.com/redis/go-redis/v9`, confined to this module.
+
+The retry hint distinguishes the two cases a weighted call produces: after a
+*successful* take it reports the wait for the next single token, and after a
+*denial* the wait for the remainder of this call's cost — so a client that comes
+back at the advertised time succeeds instead of being rejected a second time.
+
+The unit tests drive a fake scripter and can only assert that the cost reaches
+the script. The arithmetic itself is only executed by a real server, so the
+weighted behaviour is pinned by the Docker-backed integration suite:
+`TestWeightedCost`, `TestCostAboveBurstIsDeniedNotErrored`,
+`TestCostBelowOneIsClamped`, and `TestWeightedConcurrencyIsAtomic` — the last
+firing twenty concurrent cost-5 calls at a burst of 50 and requiring exactly ten
+to be granted.
 
 ### 4.3 `csrf`
 
@@ -254,6 +513,64 @@ Hardening added during the audit (§6.6):
 Documented limitations: XSS on the same origin defeats CSRF protection entirely;
 the HMAC secret must be stable across deploys and rotated deliberately.
 
+#### Rotation on privilege change
+
+`Protector.Rotate(w, r)` replaces the cookie and returns the matching token.
+Session fixation applies to CSRF: an attacker who plants a cookie the victim's
+browser keeps can compute the token that goes with it, and a forged request from
+the victim's browser then verifies. Rotating on login overwrites the planted
+value, so from that moment the victim's browser sends something the attacker
+never saw.
+
+**It is not server-side revocation, and the doc comment says so.** The scheme is
+stateless — a token is `HMAC(secret, cookieValue)`, verified by recomputation —
+so there is no issued-token list to strike from, and an old cookie paired with
+its old token still verifies. That is not the attack: presenting the old pair
+requires the attacker's own browser and their own session. The first draft of
+this feature claimed "invalidating every token issued before it"; the test
+disproved it, and `TestRotateIsNotServerSideRevocation` now pins the real limit
+so the claim cannot creep back.
+
+**The context holds a `*tokenHolder`, not a string.** If it held the string,
+`Token(r)` after `Rotate(w, r)` would return the *pre*-rotation value, the
+handler would render a dead token, and every subsequent POST would 403 — which
+is precisely the silent staleness `Token`'s `(string, bool)` signature exists to
+prevent, reintroduced by another route. The holder carries a mutex because a
+handler may hand the request to goroutines. `Rotate` also returns the new token
+directly, so the common call site does not have to ask for it again; the holder
+is for code deeper in the stack that only has `r`.
+
+**Calling `Rotate` too late is detected, not just documented.** Once the header
+block is serialized, net/http discards any further `Set-Cookie` silently. A
+handler that rotated after `WriteHeader` — or after its first `Write`, or after
+a redirect — would be told it had succeeded while the browser kept the old
+cookie, leaving open exactly the fixation the call was meant to close. The
+middleware therefore wraps the `ResponseWriter` in a recorder that notes when
+the response begins, and `Rotate` returns `ErrHeadersAlreadySent` and changes
+nothing. The flag is atomic for the same reason the holder has a mutex.
+
+The wrapper implements `Unwrap() http.ResponseWriter`, so `http.ResponseController`
+reaches `Flush`, `Hijack` and the rest through it — wrapping a ResponseWriter
+otherwise costs the rest of the chain those capabilities. The residual
+limitation is stated in the doc comment: a *direct* `w.(http.Flusher)` does not
+follow `Unwrap`, which is the assertion `ResponseController` exists to replace.
+`findRecorder` walks the Unwrap chain, so intervening middleware following the
+same convention does not hide the recorder; when none is found rotation still
+proceeds, because a safety net must not be able to disable what it guards.
+
+Both guarantees are verified by removal: deleting the check fails all three
+subtests of `TestRotateAfterWriteHeaderIsReported`, and deleting `Unwrap` fails
+`TestMiddlewareDoesNotHideFlusherOrHijacker`.
+
+**What `Rotate` does not do: it does not rotate the session identifier.** This
+is the limitation most likely to be misread, because calling it at login looks
+like it handles session fixation. It handles the CSRF half. Classic session
+fixation — an attacker fixing the victim's *session* cookie and then riding the
+authenticated session — is defeated by issuing a new session ID at the privilege
+change, which belongs to the consumer's session layer and which this package
+cannot reach. A login that does only one of the two remains vulnerable to the
+other, and doing only this one is the easier mistake.
+
 ### 4.4 `secureheaders`
 
 Sets `Content-Security-Policy`, `Strict-Transport-Security`, `X-Frame-Options`,
@@ -271,6 +588,132 @@ so there is no ordering reason to delay them, and a real reason not to: an
 error page is exactly as capable of being framed, sniffed as a different
 content type, or rendered without a CSP as a success response is.
 
+#### CSP nonces
+
+The strict default CSP forbids inline scripts, and real pages have them. The
+usual response is `'unsafe-inline'`, which permits every inline script including
+the injected one — equivalent to having no script policy. A per-request nonce
+keeps the policy strict and still runs the scripts you wrote.
+
+**A named directive that is absent is added, not skipped.** `DefaultCSP` has no
+`script-src` at all; it relies on `default-src 'self'`. Skipping would leave the
+nonce in the context and absent from the policy — templates emit `nonce="..."`,
+the browser ignores it, and the operator has a silently broken CSP, which is
+what the requirement said must not happen. Adding `script-src 'nonce-X'`
+*tightens* instead: scripts now need the nonce rather than merely being
+same-origin. The cost is that same-origin `<script src>` tags need the attribute
+too, which is documented prominently on the option — a nonce whose policy still
+admitted every same-origin script would be decoration.
+
+**A CSPRNG failure rejects the request.** This is a new rejection point in a
+package that previously had none, so under §3.4 it needs a customizable handler:
+`WithNonceErrorHandler`. Falling through would serve a page whose own scripts
+its policy blocks; serving an empty nonce is worse, because `'nonce-'` matches
+nothing and nothing reports it. The failure path is otherwise unreachable from
+outside the package, so an unexported `withNonceSource` test hook exists —
+unexported specifically because an exported one would invite supplying a
+predictable nonce, which defeats the mechanism.
+
+`Nonce(r)` returns `(string, bool)`, mirroring `csrf.Token` for the same reason:
+a bare `""` renders `nonce=""`, every script is blocked, and the fastest apparent
+fix is `'unsafe-inline'`.
+
+The policy is split around the insertion points once at construction, so the
+per-request cost is a `strings.Builder` walk rather than a parse.
+
+#### `NoStore` is a function, not an option
+
+RFC 6749 §5.1 requires `Cache-Control: no-store` and `Pragma: no-cache` on the
+OAuth token response. It is a per-*route* requirement: applied to a whole chain
+it would disable caching of static assets and public responses, trading a
+requirement that covers a handful of routes for a site-wide regression. So it is
+a plain `func(http.Handler) http.Handler`, which is how this library expresses
+per-route.
+
+`no-store` rather than `no-cache`: `no-cache` lets a shared cache *store* the
+response and merely revalidate, which still leaves a token sitting in a proxy.
+
+#### `ClearSiteData` for logout
+
+Server-side invalidation ends the session; it does not remove what the browser
+already holds. The access token in localStorage survives, the authenticated
+pages in the HTTP cache are served when the user presses Back, and a second tab
+keeps rendering the logged-in view. On a shared machine that residue is the
+whole problem the user was trying to solve.
+
+`ClearSiteData(types...)` is per-route, for the same reason `NoStore` is: it
+belongs on the logout response and nowhere else.
+
+Two things are documented prominently because they are the ways this gets
+misused:
+
+- **It is ignored on non-secure origins and support is uneven**, so it is
+  defense in depth on top of real invalidation, never the mechanism. A logout
+  that relies on the client agreeing to forget is not a logout.
+- **`cookies` clears the registrable domain, not the origin.** Logging out of
+  app.example.com also clears cookies for shop.example.com. That may be the
+  intent or may be a surprise, and it is the one part worth checking before
+  deploying.
+
+`executionContexts` is excluded from the default (and `"*"` is not used, since
+it implies it). Reloading every other tab on the origin is a visible, surprising
+effect that belongs to a deliberate choice.
+
+The values are quoted, because browsers ignore unquoted ones — which would make
+the middleware silently do nothing. `TestClearSiteDataValuesAreQuoted` pins it.
+
+#### COOP, CORP and COEP: opt-in, and this is a closed decision
+
+**Decision, settled:** all three ship as options. **None becomes a default in
+v0.2.0.** `COOPSameOriginAllowPopups` and `CORPSameOrigin` remain candidates for
+some later version, and if either is ever promoted it must be announced in the
+changelog as a behaviour change. **COEP never becomes a default, in any
+version.** Nothing here is awaiting further input.
+
+All three are available through `WithCrossOriginOpenerPolicy`,
+`WithCrossOriginResourcePolicy` and `WithCrossOriginEmbedderPolicy`. **None is
+in the default set**, and `TestCrossOriginHeadersAreNotDefaults` fails if one
+ever becomes one without the change being deliberate.
+
+The reasoning is about the shape of the risk, not about the headers' value. A
+default in a *published* security library changes behaviour for every deployed
+consumer on upgrade, with no compile error to warn anyone, and each of these
+three fails in a way the server cannot see: the server keeps returning 200 and
+the browser discards or refuses to load something. That is the worst diagnostic
+profile a regression can have.
+
+Per header:
+
+- **COOP.** `same-origin` breaks the popup OAuth and payment pattern outright —
+  the popup can no longer `postMessage` back to its opener, and the flow hangs
+  with no catchable error, so it is permanently unsuitable as a default.
+  `same-origin-allow-popups` is the value most applications want and is a
+  candidate for a later version; even it breaks an application that is *itself*
+  opened as a popup and talks to its opener, which is exactly what an identity
+  provider or an embeddable widget is — so promoting it is a changelog event,
+  not a quiet tightening.
+- **CORP.** Real value against speculative-execution cross-origin reads and
+  XSSI. But it is a statement about responses, and this library sits in front of
+  things that are deliberately cross-origin: public APIs, CDN assets, fonts,
+  avatars. `same-origin` by default would break those silently. Also a candidate
+  for a later version, under the same changelog condition.
+- **COEP.** Never a default, in any version — this is settled, not deferred.
+  `require-corp` refuses every
+  cross-origin subresource that does not opt in, so third-party images, fonts,
+  analytics and embedded iframes stop loading unless each third party cooperates
+  — which most do not. It exists only because it is the price of cross-origin
+  isolation (with COOP `same-origin`) for SharedArrayBuffer and high-resolution
+  timers. An application that does not need those gains nothing from it.
+
+The mixed CORP case — a strict chain with some public assets — is served by the
+package's existing contract that headers are written before the handler runs, so
+a route may overwrite any of them. `TestCORPCanBeOverriddenPerRoute` documents
+that shape.
+
+`TestCrossOriginHeadersAreNotDefaults` enforces the decision in code: it fails
+if any of the three appears in the default set, so promoting one cannot happen
+as a side effect of an unrelated edit.
+
 ### 4.5 `validate` and `sanitize`
 
 Validation and sanitization are kept separate on purpose: a rule answers "is
@@ -287,11 +730,61 @@ stripping control characters (which have been used for log injection and
 terminal escape injection), and collapsing whitespace. See §6.4 for what was
 removed and why.
 
+#### `URL` and the control-character bypass
+
+`validate.URL(schemes...)` allows `http` and `https` by default. The threat is a
+user-supplied URL later rendered into an `href`: `javascript:` runs in your
+origin with the victim's session, and `html/template` does not help — inside an
+`href` a `javascript:` URL is a *valid* URL, not a syntax error to escape.
+
+The substance is not the allow-list, which is obvious, but two things around it:
+
+- **Control characters are rejected before parsing — but measure who is
+  actually rejecting them.** A browser strips tab, newline and carriage return
+  before reading a URL's scheme, so `"java\tscript:alert(1)"` navigates as
+  `javascript:`. An allow-list comparing the *parsed* scheme is where that gets
+  through.
+
+  The first version of this section claimed the pre-check was what closed that
+  bypass. Checking rather than asserting showed otherwise: **`net/url` refuses
+  to parse a control character in the scheme, host or path**, so on current Go
+  the disagreement never arises and the rule rejects on the parse error. The
+  original table test passed identically with the pre-check deleted — it was
+  testing `net/url`, not this package.
+
+  The pre-check stays, for two non-hypothetical reasons: a guarantee that is a
+  side effect of another package's current strictness is one upgrade away from
+  not holding, and it rejects cases `net/url` *does* accept — control characters
+  in a fragment, spaces in a path, query or trailing position, all of which
+  parse cleanly with an allowed scheme.
+
+  The testing was restructured to match. `hasControlOrSpace` is a named function
+  so it can be tested on its own; `TestPreCheckRejectsWhatNetURLAccepts` uses
+  only inputs `net/url` accepts, so the pre-check is the sole thing that can
+  reject them (verified: it fails on all seven when the check is removed); and
+  `TestNetURLRejectsControlCharactersInScheme` is a canary that fails if a
+  future Go loosens the scheme check, at which point the pre-check stops being
+  defense in depth and becomes load-bearing.
+
+  The fuzz target still asserts the end-to-end property: for any input the rule
+  accepts, the browser-stripped form must not begin with a script-bearing
+  scheme.
+- **A scheme is required**, which rejects `//evil.example.com` — scheme-relative,
+  parsed with an empty scheme, treated by a browser as "same scheme as the
+  current page", and the classic open-redirect payload.
+
+Deliberately out of scope: host allow-listing and DNS resolution. An allowed
+scheme still permits any host, so this is not sufficient for a redirect target
+and is not an SSRF defence; both need application knowledge this package does
+not have. Also out of scope is anything OAuth-shaped — exact `redirect_uri`
+matching, registered-origin comparison — which would make this a rule about one
+protocol rather than about input.
+
 ### 4.6 `pathguard`
 
 Prevents path traversal when resolving user-supplied paths under a root.
 
-**Primary implementation: `os.Root` (Go 1.24+; this module requires 1.25).** `os.OpenRoot` enforces
+**Primary implementation: `os.Root` (Go 1.24+, which is this module's floor).** `os.OpenRoot` enforces
 containment at the syscall layer, which closes the TOCTOU window that any
 resolve-then-open approach leaves open: between `EvalSymlinks` returning a safe
 path and the subsequent `os.Open`, an attacker with write access to the tree can
@@ -303,6 +796,245 @@ depth pre-check and for path validation that does not open a file.
 
 Also provided: `ResolveNew` for paths that do not exist yet (validating the
 parent), since upload destinations are a common real-world need.
+
+### 4.7 `realip`
+
+Derives a client address from a request that arrived through reverse proxies.
+
+**Why it exists at all.** `ratelimit` correctly refuses to read `X-Forwarded-For`
+and tells the operator to supply a `KeyFunc` that reads the forwarded header
+"only after confirming the peer really is that proxy" (§4.1). That advice was
+sound and unserviced: the library named the sensitive code and then left every
+consumer to write it by hand. A security library that documents a trap without
+shipping the tool to avoid it has moved the risk, not reduced it.
+
+**Configuration is a set of trusted proxy CIDRs, and nothing else.** There is no
+per-request permissive mode and no "trust the header anyway" flag. When the peer
+is outside the set, every forwarding header is ignored in full and `RemoteAddr`
+is returned. A flag to relax that is a flag that lets clients choose their own
+identity, which would make the rest of the package decorative.
+
+An empty trusted set is an error rather than "trust nothing", because the
+overwhelmingly likely cause is an unset environment variable. Failing loudly at
+startup beats an operator believing a proxy configuration is in effect when it
+is not. Wanting `RemoteAddr` alone is already spelled `ratelimit.RemoteAddrKey`.
+
+The same reasoning refuses the *other* end of the range. A trusted set of
+`0.0.0.0/0` or `::/0` reaches the permissive mode this package will not ship, by
+configuration rather than by flag: every client becomes a trusted proxy, so
+`X-Forwarded-For` is honoured from anyone and the rate-limit key becomes whatever
+the client types. `New` therefore returns `ErrDefaultRouteTrusted` unless
+`InsecureTrustEveryPeer()` says otherwise (§6.12).
+
+#### The chain is walked right to left. Here is the bypass if it is not.
+
+A proxy **appends** the address it received from to the right-hand end of the
+chain; it does not replace what is already there. That single fact decides the
+direction of the walk.
+
+Take a service behind one trusted load balancer at `10.0.0.1`, rate limiting by
+client IP. An attacker sends:
+
+```http
+GET /login HTTP/1.1
+X-Forwarded-For: 1.2.3.4
+```
+
+The load balancer appends the address it actually saw, and the application
+receives:
+
+```http
+X-Forwarded-For: 1.2.3.4, 198.51.100.23
+RemoteAddr: 10.0.0.1:54321
+```
+
+Read **left to right**, the answer is `1.2.3.4` — a value the attacker typed.
+Nothing stops them typing a different one on the next request:
+
+```
+X-Forwarded-For: 1.2.3.5   ->  key 1.2.3.5   -> fresh bucket
+X-Forwarded-For: 1.2.3.6   ->  key 1.2.3.6   -> fresh bucket
+X-Forwarded-For: 1.2.3.7   ->  key 1.2.3.7   -> fresh bucket
+```
+
+Every request mints a new bucket, so the limiter admits every request. The
+limit is not weakened, it is *absent*, and it is absent in exactly the scenario
+it was deployed for — credential stuffing against `/login` from behind a
+CDN. Worse, the attacker can pick a victim's address and exhaust *their*
+allowance, turning the limiter into a denial-of-service tool aimed at whoever
+they choose.
+
+Read **right to left**, the walk starts at `198.51.100.23`, which the load
+balancer wrote and the client could not touch. It is not in the trusted set, so
+it is the answer. The attacker's `1.2.3.4` sits to its left and is never
+reached. Entries that *are* in the trusted set are skipped, so multiple proxy
+hops work: the walk stops at the first entry that a trusted machine did not
+write.
+
+The general rule: **everything to the left of the first untrusted entry is
+attacker-controlled**, because a client can prepend arbitrary content and no
+proxy removes it. Only the suffix appended by trusted infrastructure carries any
+guarantee, so only the suffix may be used.
+
+An entry that does not parse as an address ends the walk and yields the peer.
+Skipping over it would reconnect the trusted suffix to a client-written prefix
+across a gap that nothing accounts for, which is the same bug with extra steps.
+
+#### Multiple sources are opt-in, and precedence does not fall back
+
+`Forwarded` (RFC 7239) and `X-Real-IP` are supported, but the default reads
+`X-Forwarded-For` alone. Enabling a source is a claim that *your proxy owns that
+header* — writes it, or strips it. That claim is what right-to-left parsing
+depends on, and it does not transfer between headers.
+
+Concretely: a proxy that appends to `X-Forwarded-For` and ignores `Forwarded`
+delivers a client's `Forwarded: for=1.2.3.4` untouched. That chain has exactly
+one element, written by the client, with no trusted suffix. Walking it right to
+left stops immediately on the forged entry. The direction of the walk cannot
+rescue a header the proxy never touched — so the defense is to not enable it.
+
+Precedence is "first source present wins", with no fallback when the winning
+source turns out to be unusable. Falling through would let an attacker who
+cannot forge the header the proxy writes send a deliberately broken
+higher-precedence header and steer the lookup onto one the proxy does not
+sanitize.
+
+#### Testing
+
+The fuzz target carries two properties, and the split is deliberate:
+
+1. An untrusted peer never steers the result. **This property does not test the
+   walk direction** — when the peer is untrusted the headers are never read, so
+   a left-to-right implementation satisfies it too. Verified: with the walk
+   reversed, `TestKeyFuncCannotBeSteeredByAnUntrustedPeer` still passes.
+2. With a trusted peer, a chain of `<fuzzed junk>, <address the proxy observed>`
+   must resolve to the observed address (or to the peer, when the junk is
+   unparsable and legitimately breaks the chain). This is the property that
+   pins the direction: reversing the walk fails it on seed #6 immediately, and
+   fails 19 of the table-driven cases.
+
+Property 1 alone would have been a test that passes against the bug it exists
+to catch.
+
+### 4.8 `secret`
+
+Holds byte secrets so they cannot escape through formatting.
+
+**The threat is accidental output, not an attacker in the process.** A signing
+key in a `[]byte` is one `%+v` away from a log aggregator, and it is rarely a
+deliberate print that does it: a struct dumped while debugging, a config
+marshalled into a startup line, `slog.Any("config", cfg)`. `secret.Value` makes
+every standard output path write `[REDACTED]`, and the bytes leave only through
+an explicit `Bytes()` call that a reviewer can see.
+
+This is not encryption and not memory protection. Anything that can read process
+memory recovers the value trivially. The claim is about printing, and nothing
+else.
+
+#### `fmt.Formatter`, not just `fmt.Stringer`
+
+`Stringer` is consulted only for `%v`, `%s`, `%q`, `%x` and `%X`. A `%d` against
+a struct holding a `Value` descends into the fields and prints the bytes as
+numbers. `Formatter` is consulted for every verb, so implementing it leaves no
+verb that reveals anything. `%#v` routes to `GoString`; everything else,
+including width and precision, writes the placeholder — honouring a precision
+would let a caller extract the value one character at a time.
+
+`String` and `GoString` are kept even though `fmt` no longer reaches them, because
+code outside `fmt` calls them directly: a hand-written error message doing string
+concatenation, a logging façade type-switching on `fmt.Stringer`. They are tested
+by direct call for exactly that reason.
+
+Receivers are by value. A `String` method on a pointer receiver is skipped for a
+non-pointer argument, which is the most common way this kind of type is written
+wrong.
+
+#### Two paths no method can cover, and why the bytes are masked
+
+Redaction by method has a floor. Two `fmt` paths never consult the method table:
+
+1. **The bad-verb path.** `fmt` handles `%p` before looking for a `Formatter`,
+   and a struct is not a pointer, so it routes there; `%w` outside `fmt.Errorf`
+   lands in the same place. The path sets an internal `erroring` flag that
+   suppresses `Formatter` *and* `Stringer` at every nesting depth, then dumps the
+   value structurally. Measured, not assumed: `%T`, `%p` and `%w` are the
+   complete set that escapes `Formatter` — ordinary unknown verbs (`%h`, `%z`)
+   do reach it and hit its default branch.
+2. **An unexported struct field.** `fmt` walks fields by reflection and cannot
+   call methods on a value it cannot convert back to an interface.
+
+Both were found by the test rather than by reasoning — the first draft
+implemented every method the design called for and still leaked, which is the
+argument for writing the "no verb may leak" test before believing the design.
+
+Neither is overridable; they are properties of `fmt` and `reflect`. So the
+defence is not another method: the bytes are stored XOR-masked under a keystream
+derived **per `Value`**, and plaintext exists only inside `Bytes()`. Both paths
+then print keystream output and a nonce, which carry no information.
+
+The derivation is `HMAC-SHA-256(processKey, nonce || counter)`, with `processKey`
+held as package state and never as a field of a `Value`. That placement is
+load-bearing rather than tidy: the paths this defends against dump a `Value`
+*structurally*, so a pad stored beside the bytes it masks would be printed
+alongside them and XOR straight back to the plaintext. A per-`Value` pad held in
+the struct would be worse than no mask at all. §6.12 covers what the previous
+single shared pad leaked and why it had to go.
+
+`Equal` can no longer compare stored bytes — equal secrets under different
+keystreams mask differently. It folds four bytes per position instead,
+`masked_a ^ ks_a ^ masked_b ^ ks_b`, which is `plaintext_a ^ plaintext_b`
+without either plaintext ever being assembled. Constant time is preserved
+because every position is visited, differences are accumulated with `OR` rather
+than branched on, and the one decision is taken at the end. Keeping the
+plaintext off the heap is what ruled out the obvious
+`bytes.Equal(v.Bytes(), other.Bytes())`, and a test asserts the allocation cost
+does not grow with the secret so that version cannot come back.
+
+`Value` holds a slice, so it is not comparable with `==` and cannot be a map key.
+That is load-bearing rather than incidental: it forces every comparison through
+`Equal`, which is constant time. `TestValueIsNotComparable` asserts it, so a
+future change to a fixed-size array would fail rather than silently reopen the
+timing side channel.
+
+#### Unmarshalling is not the inverse of marshalling
+
+`Value` marshals to `[REDACTED]`, so a round trip would install the literal
+placeholder as the secret. Every instance would then agree on a well-known value
+and CSRF tokens signed with it would verify against forgeries. `UnmarshalText`
+and `UnmarshalJSON` therefore return `ErrRedacted` for that input: a silent
+compromise becomes a startup error.
+
+The text is taken as-is rather than base64-decoded. Guessing at an encoding would
+make a secret that happens to be valid base64 mean two different things.
+
+### 4.9 `csrf.GenerateSecret` returns a `secret.Value` — the break, and why
+
+`GenerateSecret`, `csrf.New` and `preset.Config.CSRFSecret` all changed from
+`[]byte` to `secret.Value`. This is a source break, taken deliberately under §8.
+
+**Why all three and not just the generator.** Changing only `GenerateSecret`
+would put the protective type on the function that *produces* a secret and not
+on the ones that *consume* it. Every call site would become
+`csrf.New(v.Bytes(), ...)`, the raw `[]byte` would travel through application
+code exactly as before, and the type would be pure ceremony — worse than
+useless, because it would look like the problem had been addressed. The whole
+value of the wrapper is that it is unavoidable.
+
+**The alternative was `GenerateSecretValue`.** Zero breakage, but two functions
+doing the same job forever, with the unprotected one appearing first in godoc
+and in the README and therefore in everything copied from them. The `secret`
+package would become opt-in decoration.
+
+`preset.Config` is the most important of the three. A `Config` struct is exactly
+the kind of thing an application logs at startup.
+
+`cmd/moat-secret` is the one place that calls `Bytes()` to unwrap deliberately —
+printing is the command's entire purpose, so the unwrap is intent, not accident.
+Everywhere else the `Value` is passed along unopened.
+
+Migration cost was 8 call sites, all tests and examples. Callers loading from an
+environment variable or a secret store wrap at the boundary with `secret.New`,
+which `examples/basic` demonstrates.
 
 ---
 
@@ -319,8 +1051,10 @@ These are treated as requirements, not nice-to-haves.
    pkg.go.dev and compiled by `go test`, so documentation cannot drift from the
    API. Examples that would depend on wall-clock timing or network are written
    as compile-only examples (no `// Output:` line) rather than as flaky tests.
-5. **`csrf.GenerateSecret() ([]byte, error)`** to remove first-run friction,
-   returning a value — never printing. A library that writes to stdout/stderr is
+5. **`csrf.GenerateSecret() (secret.Value, error)`** to remove first-run
+   friction, returning a value — never printing. (It returned `[]byte` up to
+   v0.1.0; §4.9 records the migration to `secret.Value` and why the whole
+   cascade had to move together.) A library that writes to stdout/stderr is
    unusable in a serious application (§6.8). A `cmd/` helper wraps it for CLI use.
 6. **Doc comments carry the threat model**, not just the API shape. For a
    security library, "why" is the load-bearing part of the documentation.
@@ -378,9 +1112,18 @@ returns `""` silently. All three addressed in §4.3.
 Resolve-then-open is racy against symlink swaps. Adopted `os.Root` (Go 1.24+) as
 the primary mechanism (§4.6). This raises the minimum Go version to 1.24 — an
 acceptable trade for closing a real race in the component whose entire job is
-containment. The shipped `go.mod` declares **1.25**, one release above the
-technical floor, because that is the toolchain the project is developed and
-tested against; nothing in the code requires it.
+containment.
+
+The core `go.mod` declares exactly **1.24**, the technical floor. A library
+declares the lowest version it can actually be built with, not the newest
+toolchain its authors happen to run: every release above the floor is a
+consumer excluded for no reason. The core has zero external dependencies, so
+nothing pushes it past `os.Root`.
+
+The two satellite modules do declare **1.25**, and not by choice —
+`redisstore` because `testcontainers-go` requires 1.25, `examples/` because
+`gin` does. `go mod tidy -go=1.24.0` refuses in both. Since neither module is
+on the import path of a core consumer, their floors do not propagate.
 
 ### 6.8 Library-side logging and printing
 
@@ -450,6 +1193,506 @@ trade-off:
 `v0.1.0` was tagged on the commit that closes this section, not on any earlier
 one — see §8.
 
+### 6.12 Post-v0.1.0: three security fixes, all blocking v0.2.0
+
+A review after the first tag found three places where a documented protection was
+weaker than its documentation claimed. All three share a shape worth naming: the
+code was not wrong by accident, it was wrong in a way the surrounding prose had
+already argued against. Each fix ships with a **negative control** — the previous
+behaviour restored, the new test confirmed to fail, then the fix put back — on the
+principle §6.11 established. A test that passes against both implementations is
+testing nothing.
+
+#### M-1: eviction granted a limit reset (`ratelimit.MemoryStore`)
+
+`reclaim` refused to discard a bucket that had not refilled, and its comment gave
+the reason: discarding an empty bucket resets the client's allowance, which is a
+rate-limit bypass. `evictOverCap`, in the same file, did exactly that with no
+condition — `order.Back()`, the least recently used entry, deleted.
+
+The contradiction was reachable without an attacker minting keys. A client
+exhausts its burst on `/login`; the empty bucket stops being touched, so it drifts
+to the tail of the recency list; once `DefaultMaxKeys` distinct keys arrive behind
+it, it is deleted and the next request builds a full bucket. Any service with more
+than 100k distinct clients per window does this to its own users continuously. The
+effective limit stops being `PerSecond` and becomes the store's turnover rate.
+
+The root cause is that **recency is anti-correlated with safety here**. A
+throttled client cannot make requests, so its bucket is the *least* recently used
+by construction — LRU selects the bucket whose loss grants the most. The fix
+inverts the ordering: discard the **most refilled** bucket, whose loss grants the
+least, and which in the ordinary case is at capacity and grants nothing at all.
+
+The sort key is `fullAt`, the instant a bucket reaches capacity, not the token
+count. Token counts move with the clock and would mean re-sorting the store on
+every call; `fullAt` is static between `Take`s and orders identically, since a
+bucket holds `burst - (fullAt - now) * rate` tokens at any instant. `container/list`
+became a min-heap on `fullAt`. One structure now serves both paths (§10.1).
+
+The heap is hand-written rather than driven through `container/heap`, for a
+measured reason: this is the hot path, and reaching `Less`/`Swap` through an
+interface cost about 115ns of the 240ns per `Take` at 100k keys. The concrete
+version runs at about 125ns against the recency list's 67ns. That remaining ~58ns
+is the O(log n) sift, and it is the price of the property. It is written down here
+because "no regression on the hot path" was a stated constraint and this is a
+regression, just a bounded and justified one. A randomized invariant test checks
+the heap directly, since an ordering that is subtly wrong would silently return
+eviction to picking arbitrary buckets while every behavioural test still passed.
+
+The residual case was decided rather than left implicit: when *every* tracked
+bucket is still in debt there is no cost-free eviction available, and the cap wins
+anyway — growing the map without limit would reinstate the memory-exhaustion
+vector the cap exists to close (§6.5), which is the worse of the two. The bucket
+closest to full is dropped, the smallest grant on offer. Reaching that state costs
+an attacker `maxKeys × PerSecond` requests per second sustained, every one already
+counted against a bucket. `WithMaxKeys` now says all of this, and in particular
+names the failure as a **bypass** rather than as the fairness problem it used to
+describe ("a flood of unique keys resets a legitimate client's bucket") — the two
+readings call for different sizing decisions.
+
+One thing the fix had to avoid: a newly created bucket is at capacity, so under
+the new ordering it is the most attractive eviction candidate and would evict
+itself, leaving the key untracked and its next request starting from a full burst
+again. Room is therefore made *before* the insertion, not after.
+
+#### M-2: `realip.New` accepted `0.0.0.0/0` in silence
+
+The package documentation stated "There is no permissive mode". `New` accepted the
+default route without comment, which is the permissive mode reached by
+configuration instead of by flag: every peer becomes a trusted proxy, so
+`X-Forwarded-For` is honoured from anyone and the rate-limit key becomes whatever
+the client types — a new identity per request.
+
+What decided the fix was the asymmetry, not the severity. `New` already rejected
+the *empty* list with `ErrNoTrustedProxies`, reasoning that the likely cause is an
+unset environment variable. Failing loudly on the harmless misconfiguration while
+silently accepting the maximally dangerous one is not a defensible pair.
+
+Only the default route is refused, not wide prefixes generally. A bit-count floor
+was considered and rejected: it is a guess about topology the library does not
+have. `10.0.0.0/8` and `fc00::/7` are legitimate proxy ranges already sitting at
+the wide end, so a floor tight enough to add anything over `/0` would reject real
+configurations, and a looser one would add nothing. `0.0.0.0/0` has no legitimate
+reading. Normalization already folds `::ffff:0:0/96` to `0.0.0.0/0`, so both
+spellings land on the same check.
+
+The escape hatch is `InsecureTrustEveryPeer()` — deliberately not spelled
+`With...`, deliberately not a bool field, in the same spirit as
+`preset.Config.DisableCSRF`: it should be impossible to read a call site
+containing it and not notice. The sentinel is `ErrDefaultRouteTrusted`, its own
+error rather than a generic one, so a caller can distinguish it from a malformed
+CIDR. Options are now applied before the CIDRs are parsed, because one of them
+decides what counts as valid.
+
+**Known and accepted limitation.** The check does not catch a trusted set that
+covers the whole address space in pieces — `0.0.0.0/1` plus `128.0.0.0/1` is
+equivalent to `0.0.0.0/0` in every way that matters, and passes. This is
+documented on `ErrDefaultRouteTrusted` rather than fixed, for two reasons. The
+failure being targeted is an *accident*: an operator who does not know the
+balancer's range writing the default route to make things work. Splitting it
+across two lines is not an accident, and whoever writes it has already chosen to
+trust everyone — the named opt-out exists for exactly that person. And closing it
+would mean deciding how much aggregate address space is too much, which is the
+bit-count floor rejected in the paragraph above, now summed over the set: the
+same guess about topology with more arithmetic behind it. A passing `New` means
+"this set is not the default route", not "this set has been checked for breadth",
+and the documentation now says so in those words so the check is not mistaken for
+complete coverage.
+
+#### M-3: the secret mask was one shared, repeating pad (`secret`)
+
+64 random bytes, XOR applied by position, shared by every `Value` in the process.
+Two consequences, neither documented, both *inside* the scenario the mask exists
+for — an adversary holding leaked masked bytes:
+
+1. **Keystream recovery.** Anyone with the masked bytes of a secret whose
+   plaintext they know or supplied recovered up to 64 bytes of keystream by XOR.
+   Every other masked value leaked from that process then decrypted for free.
+2. **Pad reuse.** For a secret longer than 64 bytes the pad repeated, so XORing
+   two blocks cancelled the keystream and left the XOR of two plaintext blocks —
+   structure, with no known plaintext needed at all.
+
+The mask's guarantee had quietly degraded from "reveals nothing" to "reveals
+nothing unless you have one known plaintext from the same process", and that
+clause was written down nowhere.
+
+**The obvious fix would have made it worse.** A random pad per `Value`, of the
+same length as the secret, kills both consequences and is the simplest thing to
+audit — but the pad has to live somewhere, and a field on `Value` is exactly the
+wrong place. The two paths the mask defends against dump a `Value`
+*structurally*; a pad stored beside the bytes it masks would be printed alongside
+them, and the two XOR back to the plaintext. The current design works precisely
+because the keystream is *not* in the struct.
+
+So the keystream is derived, not stored: each `Value` carries a nonce, and its
+stream is `HMAC-SHA-256(processKey, nonce || counter)` with `processKey` as
+package state. Recovering one `Value`'s keystream yields the input to a one-way
+function rather than the process key, so it says nothing about any other `Value`;
+counter mode extends the stream to any length without a block recurring. The
+nonce is an atomic counter, not a random draw — uniqueness is the only property
+required, since unpredictability comes from `processKey`, and a counter delivers
+it outright where a random draw only makes collisions unlikely and can fail at the
+CSPRNG. Its start is randomized so a structural dump does not advertise how many
+secrets the process has created.
+
+`Equal` was the delicate part, as expected. It compared masked bytes directly,
+which was correct *only* while the keystream was shared and positional — the same
+property that caused failure (1). Under per-`Value` streams, equal plaintexts mask
+to unrelated bytes. The replacement folds four bytes per position,
+`masked_a ^ ks_a ^ masked_b ^ ks_b`, which equals `plaintext_a ^ plaintext_b`
+while neither plaintext is ever assembled: they exist only as intermediate values
+of that expression, so there is no unmasked buffer to allocate, leak into a heap
+dump, or forget to wipe. That constraint is what ruled out the one-line
+`bytes.Equal(v.Bytes(), other.Bytes())`. Constant time survives because every
+position is visited, differences accumulate with `OR` instead of being branched
+on, and the single decision is taken at the end over the accumulator; the
+keystreams are generated in the same order and quantity for any two inputs of a
+given length. The length check still short-circuits, as it always did, and leaks
+only the length — which `subtle.ConstantTimeCompare` cannot hide either and which
+is not usefully secret.
+
+Timing cannot be unit-tested without flakiness, so the tests pin what can be
+checked deterministically: correctness at every block seam, and — as the guard
+against the `Bytes()`-based rewrite — that the per-call allocation cost does not
+grow with the secret's length. The `Bytes()` version fails that by two orders of
+magnitude.
+
+The package documentation now carries the revised threat model explicitly,
+including the statement that anything able to read process memory holds
+`processKey` and can unmask everything. That line is not a defect being confessed;
+it is the boundary no in-process masking scheme can cross, and saying so is what
+keeps the mask from being mistaken for encryption.
+
+#### The recurrence sweep, and the one thing it found
+
+Each of the three shapes was swept for elsewhere in the tree, per the practice
+§6.11 established. M-2 and M-3 came back clean: no other constructor accepts a
+maximally-permissive value in silence, and no other code masks or compares secret
+material outside `csrf`, which uses `hmac.Equal`.
+
+M-1 did not. `redisstore` computes its own TTL correctly — `max(idleTTL, refill
+window)`, refreshed on every call, with the Lua script commenting the reason — but
+that reasoning is enforceable only as far as Redis lets it be. A server running
+under `maxmemory` with `allkeys-lru` discards keys under pressure without knowing
+they are rate-limit state, and it will drop a bucket that has not refilled. It is
+the same bug one layer down, reintroduced by deployment configuration rather than
+by code, and with the same anti-correlation: a throttled client cannot make
+requests, so its bucket is the best LRU candidate.
+
+`redisstore.New` therefore checks it: one `CONFIG GET maxmemory*` at
+construction, returning `ErrUnsafeEvictionPolicy` when the server reports a
+memory ceiling together with any policy other than `noeviction`. The escape
+hatch is `InsecureAllowKeyEviction()`, named in the same spirit as
+`realip.InsecureTrustEveryPeer()`.
+
+**The check is best-effort by design, and the asymmetry is the point.** It is
+skipped in silence whenever the answer cannot be established: the client exposes
+no `CONFIG` (matched by type assertion off `redis.Scripter`, so a custom client
+or a test double is skipped rather than rejected), `CONFIG` is disabled or
+renamed — the normal case on ElastiCache, MemoryDB, Upstash and Azure Cache — the
+server is not yet reachable, or the reply is not understood. Only a definite
+"this server evicts" produces an error. A library that guessed would either
+reject deployments it cannot inspect or claim an assurance it does not have;
+refusing only what it can see keeps the error trustworthy. `New` therefore still
+never fails because Redis is down, and the cost is one round trip bounded by the
+store's timeout, skipped entirely under the opt-out.
+
+**Two ways this is weaker than the §6.12 M-2 check, both documented on the
+error.** M-2 validates its own argument, which is immutable for the process
+lifetime. This validates another system's *mutable runtime state*:
+`CONFIG SET maxmemory-policy allkeys-lru` is one command away, and the moment it
+is most likely to be run is a memory incident — precisely when the bypass
+matters. A cluster node joining later is not covered either (every reachable
+master or shard is asked at construction, but only then). So a passing check
+means "this server reported a safe configuration at startup", never "this
+deployment is safe", and the documentation says so in those words.
+
+**A correction to the first draft of this section.** It originally offered
+`volatile-ttl` as an acceptable alternative to `noeviction`. That is wrong, and
+the check refuses it. Every bucket carries a TTL, so the `volatile-*` family
+excludes nothing here — in a Redis shared with a cache whose entries do not all
+expire, it makes the rate-limit buckets the *preferred* victims. And
+`volatile-ttl` specifically evicts the key nearest expiry; because every bucket's
+TTL is refreshed to the same value on every call, remaining TTL is a strictly
+decreasing function of time since last touch, so "nearest expiry" is "longest
+idle" restated. It is the recency ordering with a different name, carrying the
+same anti-correlation. `noeviction` is the only safe setting, and under it Redis
+rejects writes at the ceiling instead of discarding limits — a visible outage
+through `WithFailureMode` rather than an invisible bypass.
+
+### 6.13 Post-R1: a class that had only been closed at the instance
+
+#### B-1: the 429 bug was still open, and the next rejection point walked into it
+
+`secureheaders`' contract is that the headers go on *every* response, "including
+errors and redirects — an error page is still a page". The nonce-failure path
+broke it: `writeNonceError` ran before the loop that writes the headers, so the
+500 went out bare. Nothing could reach it in production (§10.11), so the
+exploitability was nil. What mattered was what it proved.
+
+§10.6 closed the `preset.API` 429-without-headers bug, and the guard added with
+it was a subtest named for the 429. That is a test for the *instance*. Nothing
+asserted the property, and the very next rejection point added anywhere in the
+tree violated it — inside the headers package itself. A class of bug is not
+closed by fixing every instance you currently have; it is closed when adding a
+new instance is caught.
+
+So the guard is now two tests that together state the class:
+
+- `TestEveryResponseCarriesTheFullHeaderSet` does not hard-code the expected
+  headers. It issues one successful request, captures whatever security headers
+  came back, and then requires that set of every other path the middleware can
+  produce. A header added to this package appears in the reference response
+  automatically and is thereby demanded of every rejection, with no edit to the
+  test.
+- `TestResponseWritingSitesAreAllAccountedFor` parses the package's own syntax
+  tree, finds every call that receives an `http.ResponseWriter` — as an argument
+  or as a receiver — and requires each to be listed with what it is. A new
+  rejection point fails this test until someone classifies it, at which point its
+  absence from the behavioural table is in front of whoever added it. This is the
+  part that makes the guard a statement about the class rather than a longer list
+  of instances. Verified by adding a throwaway rejection handler and watching it
+  fail with the site named.
+
+One existing test had to change. `TestNonceFailureRejectsTheRequest` asserted
+that *no* CSP was sent on the rejection, which put it in direct conflict with the
+package contract. Its stated requirement was "do not emit a **broken** CSP", and
+the assertion was stronger than the requirement: a policy with a dangling
+`'nonce-'` source is broken, while the configured policy *without* nonce sources
+is merely stricter — `injectNonce` only ever adds them — and is the right thing
+to put on an error page that cannot have a nonce. The assertion now says that.
+
+A note on how the fix was verified, since it is the point of the exercise: the
+first attempt at the fix silently did not apply. The tests that existed at the
+time all passed anyway. The new property test failed immediately and named the
+nine missing headers.
+
+#### B-3: toolchain, and where the bump had to live
+
+`govulncheck` reported two standard-library vulnerabilities in `redisstore`
+(GO-2026-6090 in `crypto/tls`, GO-2026-5972 in `encoding/asn1`) and four in
+`examples`, all present in go1.26.5 and fixed in go1.26.6. The core was clean —
+not by luck, but because it reaches neither package.
+
+The bump is a `toolchain go1.26.6` directive, and it needed two homes rather than
+one. Adding it to `redisstore/go.mod` and `examples/go.mod` is correct and is what
+a standalone checkout of those modules honours (confirmed: `GOWORK=off` selects
+go1.26.6). But a Go **workspace** overrides member modules' toolchain directives,
+and CI creates one — so inside the workspace those directives were inert and the
+build stayed on go1.26.5. The directive therefore also goes in the root `go.mod`,
+which is the file `actions/setup-go` reads via `go-version-file`, so every CI job
+installs go1.26.6 and the workspace it then creates inherits it.
+
+**This does not move the consumer floor.** The `go` directive is what a consumer
+sees, and it is untouched: 1.24 for the core (§6.7), 1.25.0 for the other two. A
+dependency's `toolchain` line is ignored by the module that imports it. The
+directive says how *this repository* is built, not what it demands of anyone else.
+
+**It does cost one thing, stated rather than buried.** With `toolchain` in the
+root `go.mod`, CI now builds the core with go1.26.6 instead of a 1.24.x
+toolchain, so the declared 1.24 floor is no longer exercised by any job. That
+floor was already only weakly exercised — the workspace includes members
+declaring `go 1.25.0`, which forces the whole workspace up regardless — but it is
+now definitively unverified. Closing that properly means a CI job that builds the
+core alone at 1.24 with `GOWORK=off`, which is worth adding and is not in this
+change.
+
+### 6.14 The round in one place: six findings, and what each cost
+
+The detailed reasoning for these lives in §6.12, §6.13 and §10.11. This entry is
+the log view — what was found, why it mattered, what happened — so the round can
+be read without reading the analysis.
+
+Two of the six are worth naming as a pattern: **M-1 and B-1 are both cases where
+the library contradicted its own documentation.** Not cases where the docs were
+vague and the code guessed — cases where a comment or a package doc stated the
+rule, correctly, and the code a few lines away broke it. Prose that argues for an
+invariant is evidence that someone understood it once; it is not evidence that
+anything enforces it. Both were found by reading the two against each other, and
+that is the cheapest audit technique in this document.
+
+**M-1 — `ratelimit.MemoryStore` eviction granted a limit reset.** `reclaim`
+refused to discard an unrefilled bucket and its comment named the reason, a
+rate-limit bypass; `evictOverCap`, in the same file, did exactly that with no
+condition. Reachable without an attacker: any service with more than
+`DefaultMaxKeys` distinct clients per window does it to its own users. The root
+cause was that recency is anti-correlated with safety — a throttled client stops
+making requests, so LRU selects it by construction. Eviction now orders on refill
+level. Cost: the hot path went from ~67ns to ~125ns per `Take`. §6.12.
+
+**M-2 — `realip.New` accepted `0.0.0.0/0` in silence.** The package doc claimed
+"There is no permissive mode" while the default route reached exactly that by
+configuration. What decided the fix was the asymmetry, not the severity: the
+empty list was *already* a loud error on the reasoning that it is probably an
+unset env var. Failing loudly on the harmless misconfiguration and silently
+accepting the maximally dangerous one is not a defensible pair. Now
+`ErrDefaultRouteTrusted`, with `InsecureTrustEveryPeer()` as the named opt-out.
+Known gap, documented rather than closed: split prefixes. §6.12.
+
+**M-3 — `secret`'s mask was one shared, repeating pad.** Two consequences, both
+*inside* the scenario the mask exists for: one known plaintext recovered the
+keystream for every other `Value` in the process, and a secret longer than the
+pad repeated it, leaking structure with no known plaintext at all. The obvious
+fix — a random pad per `Value` — would have been worse, because the fmt paths the
+mask defends against dump the struct *structurally*, and a pad stored beside the
+bytes it masks gets printed next to them. Keystream is now derived, not stored.
+`Equal` was rewritten to fold both keystreams into the comparison. §6.12.
+
+**B-1 — a rejection went out with no security headers, in the headers package.**
+`writeNonceError` ran before the header loop, contradicting the package's own
+"set on every response, including errors". Unreachable in production (§10.11), so
+the exploitability was nil — the finding was that §10.6's 429 bug had been closed
+at the *instance* and not the class. The guard added then was a subtest named for
+the 429; the next rejection point added anywhere violated the same property. Now
+guarded by a test that captures the header set from a real success response, plus
+an AST check that fails when the package grows a response-writing site nobody
+classified. §6.13.
+
+**B-2 — the CSPRNG fallback in `secret` was fail-open.** On `rand.Read` failure
+the process key fell back to `byte(i*31+7)`. Had it run, every `Value` would have
+been masked under a publicly derivable keystream and the two accepted leak paths
+would have gone from revealing nothing to revealing everything, silently. Dead
+code at the Go 1.24 floor, but fail-open dead code in a fail-closed library, and
+"defence in depth" was the wrong label for it. Now panics — the one documented
+exception to no-panic-in-a-library. The other CSPRNG error paths are kept and
+recorded as unreachable so nobody chases coverage over them. §10.11.
+
+**B-3 — `govulncheck` was red on two modules.** Two standard-library
+vulnerabilities reachable from `redisstore`, four from `examples`, all fixed in
+go1.26.6. Bumped via a `toolchain` directive, which needed a second home in the
+root `go.mod` because a Go workspace overrides member modules' toolchain lines and
+CI builds one. Consumer floors untouched. One stated cost: CI no longer exercises
+the declared 1.24 floor. §6.13.
+
+**Also closed in the same round, without being findings:** `gosec` was red with
+eleven results across the tree, all verified false positives — six fixed properly
+with explicit blank assignment rather than pragmas, five annotated with a reason.
+A red gate that everyone learns to ignore is worse than no gate, and on a
+published security library it is the first thing a visitor sees.
+
+### 6.15 R4: an adversarial pass over the whole library
+
+Four findings, three of them tag-blocking. The round's theme is that the two
+previous rounds fixed instances of patterns whose general form was still open.
+
+#### HIGH-1: `preset.API` gave every client one rate-limit bucket
+
+`preset.API` built the limiter with no key function, so `RemoteAddrKey` applied.
+Behind a load balancer — the topology almost every consumer has — `RemoteAddr` is
+the balancer for every client on earth, so the whole service shared one bucket
+and any single client spending its allowance held everyone else at the limit
+indefinitely. Not a bypass: denial of service against the other users, and from
+outside indistinguishable from ordinary throttling.
+
+An API failure rather than operator error, on the package's own terms. `preset`
+is the safe-by-default entry point and its `validate()` already asserts that a
+silently missing protection is a startup error — it refuses a missing CSRF secret
+and missing rate limits. It said nothing here, while the library shipped the
+correct answer in `realip` and the preset could only reach it through the
+undocumented `RateLimitOptions` escape hatch.
+
+The fix is `Config.TrustedProxies`, wired to `realip` automatically. **The shape
+of the refusal mattered more than the refusal.** Erroring on an empty
+`TrustedProxies` would have been wrong: empty cannot be distinguished from "I
+have no proxy", so it would break the legitimate direct deployment and push an
+operator to type any CIDR at all just to boot — a worse state than the one being
+fixed, because it manufactures a false trusted set. So the ambiguity is what
+becomes impossible, in the shape `DisableCSRF` established: name the proxies, or
+state the exposure with `DirectlyExposed`. Setting both is contradictory and is
+an error, like the other pairs. The question is not asked when rate limiting is
+off, and a bad CIDR — including `0.0.0.0/0`, which §6.12 already refuses — is
+reported rather than swallowed.
+
+README's claim that `preset.API` "returns an error if a protection would be
+silently missing" was false in exactly this case, and a divergence between
+security documentation and behaviour is a finding in its own right. It now says
+what is actually checked, and notes that the list grew by one when this was
+found.
+
+#### MEDIUM-1: the CSRF token was a constant, and therefore BREACH-extractable
+
+`token = base64(HMAC(secret, cookieValue))` is a pure function of the cookie, so
+it was byte-identical in every response until an explicit `Rotate`. An
+application serving compressed HTML that reflects any attacker-influenced string
+into the same response is then an adaptive compression oracle: a correct guessed
+prefix compresses shorter, and the token comes out byte by byte. With it every
+request the victim's browser can be induced to make is forgeable.
+
+The decisive argument was not BREACH in the abstract but **ecosystem parity**.
+`gorilla/csrf` masks with a fresh per-request pad for precisely this reason, so
+the mitigated form is the norm and anyone comparing the two will assume parity. A
+library whose pitch is that the plumbing was done carefully cannot be behind the
+popular alternative at the point it claims care.
+
+Tokens are now `base64(pad || mac^pad)` with a fresh 32-byte pad per response,
+unmasked before a `hmac.Equal` on the recovered MAC. Three things the change
+turned up:
+
+- Only the token needs it; the cookie is HttpOnly and never appears in a
+  compressed body.
+- The format change touches `Rotate` and `Token(r)` together, and two existing
+  tests asserted the token was *stable* across responses — the pre-fix property.
+  They now assert what actually matters: that the encodings differ and that both
+  verify against the one cookie.
+- Many encodings of one token are all valid, since XOR is commutative and any
+  `(pad, mac^pad)` works. That looks like a flaw and is not — it is what stops
+  two responses sharing bytes, and producing another encoding requires already
+  holding one. `TestManyEncodingsOfOneTokenAreAllValid` records it so nobody
+  "fixes" it later.
+
+Decoding is now `Strict()`, for both the token and the cookie. Go's default
+base64 decoder ignores the unused trailing bits of the final character, so a
+token had multiple valid encodings and mutating that character was a no-op about
+a quarter of the time. Not a vulnerability — the attacker still has to know the
+MAC — but it meant "this is not the token that was issued" and "this request is
+refused" were not the same statement, and canonical encoding makes them the same.
+
+That non-canonicality had also made `TestEndToEnd` **flaky at about 20%**,
+measured over 40 runs. It tampered with a token by replacing its last character,
+which a quarter of the time changed nothing. The flake predates the masking — the
+43-character unmasked token had the same two unused bits — and the assertion
+would have gone on "passing" against a library that accepted tampered tokens
+outright. It now mutates the first character, which always carries six
+significant bits, and 40 further runs are clean.
+
+#### MEDIUM-2: the guard against instance-level guards was itself instance-level
+
+The most instructive finding of the round. §6.13 closed the 429/nonce class with
+an AST walk that required every response-writing site to be classified — but it
+called `parser.ParseDir` on one directory, so it proved the property for
+`secureheaders` alone. The remedy for "the class was closed at the instance" had
+been applied at the instance. Adding an unhooked `http.Error` to `csrf`,
+`ratelimit`, `validate` or `pathguard` failed nothing, and §3.4's "closed" table
+would have gone quietly false.
+
+The walk now lives at the module root and covers every package in the core
+module. Verified by adding an unhooked rejection to `ratelimit` **and**
+`pathguard` simultaneously and confirming both were named — the control §6.13's
+version could not have produced.
+
+Hoisting it exposed a blind spot in the original: it followed only the
+`http.ResponseWriter` *parameter*, and `csrf.Middleware` immediately aliases its
+writer (`w := &responseRecorder{ResponseWriter: rw}`) before using it. The
+package with the most rejection points in the library reported none. The
+module-wide version tracks assignment aliases to a fixpoint, which is what makes
+`csrf.Middleware -> p.reject` visible at all.
+
+The invariant itself held throughout: every rejection point already routed
+through a `write*` helper with a configurable handler. What was missing was
+anything that would keep it holding.
+
+#### LOW-1: `csrf.WithTrustedOrigins()` with an empty slice degraded in silence
+
+The option assigned its slice unconditionally and `originMatches` tested
+`len(...) > 0`, so an operator writing `WithTrustedOrigins(cfg.AllowedOrigins...)`
+against an unset environment variable silently got host-only matching: no scheme
+pinning, no restriction between sibling subdomains. Bounded damage — host
+matching is still a real defence, and the `Secure` cookie means a genuine
+plaintext origin usually has no cookie to send — but it is the same input shape
+`realip.New` already refuses with `ErrNoTrustedProxies`, for the same stated
+reason, and that `preset` already guards with `if len(...) > 0`. Direct `csrf`
+users had neither. Now `ErrNoTrustedOrigins`, reported through `New`.
+
 ---
 
 ## 7. Testing strategy
@@ -502,6 +1745,38 @@ security guarantee. `SECURITY.md` defines private vulnerability reporting;
 issues affecting the security properties described here are handled there, not
 in public issues.
 
+### Pre-tag checklist item "audit in a clean session": NOT MET
+
+Recorded as unmet rather than closed, because it was not met and the difference
+matters.
+
+Two adversarial passes were run over this library (§6.14, §6.15) and both found
+real defects, including in code the reviewer had written — the shared rate-limit
+bucket in `preset.API` and the package-scoped invariant guard were both caught
+that way. So the passes were not worthless. But **both were performed by the same
+agent that wrote the code**, which is precisely what the checklist item exists to
+exclude.
+
+The mitigation stated at the time — weight the packages the author had not
+touched, re-read the code instead of recalling it — is honest and it addresses
+*recall* bias: the risk of reviewing a remembered version rather than the real
+one. It does not address the bias that actually matters here, which is in **where
+one chooses to look**. An author's sense of which parts are worth attacking is
+shaped by the same assumptions that produced the code, and the areas that feel
+settled are exactly the ones that get a shorter look. No amount of discipline
+inside the session corrects for that, because the omission is invisible from
+inside it: you cannot notice the question you did not think to ask.
+
+Concretely, both passes examined every package but produced findings concentrated
+in composition and in documented-invariant coverage — the shapes the author had
+been primed on by the preceding rounds. Whether the parsing and validation code
+would survive a reviewer with different instincts is untested.
+
+**What would close it:** a pass by a reviewer with no part in writing the code
+and no access to this document's reasoning, working from the public API and the
+README as a consumer would. Until then, §6.14 and §6.15 should be read as what
+they are — structured self-review that found things — and not as an audit.
+
 Threat-model limitations, restated because they matter more than the feature list:
 
 - `ratelimit.MemoryStore` is per-process; without a shared store, each instance
@@ -527,10 +1802,18 @@ that starts a goroutine per store leaks one for every caller who forgets to
 `Close`, and "forgets to Close" is the normal case for something created once at
 startup.
 
-Instead, entries are held in an LRU recency list, so expired entries accumulate
-at the tail and are reclaimed during `Take` in time proportional to the number
-actually expired. Memory stays bounded by the key cap either way, and `Close`
-becomes optional rather than load-bearing.
+Instead, entries are held in a min-heap ordered by the instant each bucket
+refills, so the buckets that are safe to forget accumulate at the root and are
+reclaimed during `Take` in time proportional to the number actually expired.
+Memory stays bounded by the key cap either way, and `Close` becomes optional
+rather than load-bearing.
+
+The ordering was a recency list until §6.12; reclaiming and evicting now read the
+same structure, because a bucket that has been idle past the cutoff has also been
+*full* past it. The proxy is conservative in the safe direction — a bucket in
+debt when last touched carries a refill instant later than its last touch, so it
+can outlive the TTL by up to one refill window. That is a memory question the key
+cap already bounds, not a correctness one.
 
 ### 10.2 An idle bucket is never dropped before it would have refilled
 
@@ -673,3 +1956,43 @@ level CSRF cookie and field name defaults (`gosecure.csrf` →
 prefix, and the `cmd/gosecure-secret` binary (renamed to `cmd/moat-secret`).
 It was done before the first tag specifically so that none of those were ever
 part of a released, importable API.
+
+### 10.11 Every CSPRNG error path in the core is unreachable at the Go 1.24 floor
+
+As of Go 1.24 `crypto/rand.Read` is defined never to fail. The signature still
+returns an error for compatibility, but a system entropy source that cannot be
+read now crashes the program irrecoverably instead of returning one. At the
+module's declared floor of 1.24 (§6.7), therefore, every error branch hanging off
+a CSPRNG call in the core module is dead code:
+
+| Site | Dead branch |
+|---|---|
+| `csrf.GenerateSecret` (`csrf.go:255`) | the returned error |
+| `csrf.newCookieValue` (`csrf.go:528`) | the rejection, and `Rotate` returning an error |
+| `secureheaders.newNonce` (`secureheaders.go:244`) | the whole `WithNonceErrorHandler` apparatus |
+
+**They are staying.** They cost nothing, they are correct, and they are the
+difference between a clean upgrade and a silent regression if the standard
+library's contract ever moves again. This entry exists so that nobody spends an
+afternoon trying to raise coverage over them from the outside: they cannot be
+provoked through the public API, only by injecting a failing source — which is
+what `secureheaders`'s unexported `withNonceSource` hook exists for, and how
+`TestEveryResponseCarriesTheFullHeaderSet` reaches the nonce rejection.
+
+**One of them was not harmless and has been removed.** `secret`'s process key
+fell back to a fixed byte pattern, `byte(i*31+7)`, on CSPRNG failure. Had it ever
+run, every `Value` in the process would have been masked under a publicly
+derivable keystream, and the two accepted leak paths — the `%p`/`%w` bad-verb
+dump and the unexported-field dump (§4.8) — would have gone from revealing
+nothing to revealing everything, with no signal that anything had changed. That
+is a fail-open default inside a library whose stated posture is fail-closed, and
+"defence in depth" was the wrong label for it: a mask an observer can derive is
+not a weaker mask, it is the appearance of one.
+
+It now panics. That is a deliberate exception to the rule that a library must not
+abort its host, and it is narrow: a process that cannot obtain entropy cannot
+generate CSRF secrets or nonces either and has no business serving requests, and
+the standard library already reached the same conclusion for the same reason.
+The neighbouring fallback in `secret`'s nonce counter is *kept*, because it fails
+open on nothing — a failed seed costs a cosmetic property while uniqueness, the
+property the security argument rests on, comes from the counter regardless.

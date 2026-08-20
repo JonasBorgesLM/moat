@@ -6,6 +6,8 @@ module github.com/JonasBorgesLM/moat/redisstore
 
 go 1.25.0
 
+toolchain go1.26.6
+
 require (
 	github.com/JonasBorgesLM/moat v0.1.0
 	github.com/redis/go-redis/v9 v9.22.0

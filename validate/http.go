@@ -27,13 +27,39 @@ import (
 //     request declares no length, and a declared Content-Length is a claim, not
 //     a fact. The header check is an optimization; the reader is the control.
 //
-// # What the middleware cannot do for you
+// # The two rejection paths, and how to make them agree
 //
-// When the limit is hit during reading, the handler's Read returns a
-// *http.MaxBytesError. That error surfaces inside your handler, not here — this
-// middleware has already returned by then. **Handlers must check the error from
-// reading or decoding the body**, and should map *http.MaxBytesError to 413.
-// Ignoring a decode error and proceeding with a zero value is the bug this
+// An oversized request is refused in one of two places, and they are answered
+// differently on purpose. Adopting this middleware means handling **both**;
+// handling one leaves your API returning two different shapes for the same
+// condition, depending only on whether the client declared its length honestly.
+//
+//  1. **The declared length is too large.** This middleware answers 413 itself,
+//     before the body is read. Replace that response with
+//     [WithMaxBodyErrorHandler] so it carries your error envelope.
+//
+//  2. **The client lied, or declared nothing.** Nothing is known until the body
+//     is read, so the limit is enforced by http.MaxBytesReader inside your
+//     handler. The handler's Read returns a *http.MaxBytesError, and **this
+//     middleware has already returned by then** — it cannot write a response
+//     for you. Match the error with errors.As and emit the same envelope:
+//
+//     var maxErr *http.MaxBytesError
+//     if errors.As(err, &maxErr) {
+//     writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+//     return
+//     }
+//
+// The asymmetry is one of mechanism, not of result: one path is configured with
+// an Option and the other is handled downstream with errors.As, but both are
+// meant to produce the same status and the same body. See [ExampleMaxBodyBytes]
+// for the two wired together.
+//
+// Delegating the second path is the correct design rather than a gap. The
+// middleware is no longer on the stack when the read fails, and a middleware
+// that tried to write then would be racing a handler that may already have sent
+// headers. **Handlers must check the error from reading or decoding the body**;
+// ignoring a decode error and proceeding with a zero value is the bug this
 // middleware cannot prevent for you.
 //
 // MaxBytesReader also arranges for the connection to be closed rather than
@@ -49,24 +75,71 @@ import (
 //
 // n is the maximum number of bytes readable from the body. A negative n is
 // treated as zero, which rejects any request that carries a body at all.
-func MaxBodyBytes(n int64) func(http.Handler) http.Handler {
+func MaxBodyBytes(n int64, opts ...BodyLimitOption) func(http.Handler) http.Handler {
 	if n < 0 {
 		n = 0
+	}
+	var cfg bodyLimitConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// ContentLength is -1 when unknown (a chunked request), in which
 			// case there is nothing to compare and MaxBytesReader does the work.
 			if r.ContentLength > n {
-				http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+				cfg.writeTooLarge(w, r)
 				return
 			}
+			// Wrapped unconditionally, and never with the declared length: a
+			// Content-Length small enough to pass the check above is still only
+			// a claim, so the reader must enforce n regardless of what was
+			// declared. Making this wrap conditional would be a bypass.
 			if r.Body != nil {
 				r.Body = http.MaxBytesReader(w, r.Body, n)
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// BodyLimitOption configures [MaxBodyBytes].
+//
+// It is a distinct type from [ContentTypeOption] so that an option cannot be
+// passed to the constructor it does not belong to. A single shared option type
+// would compile and then silently do nothing, which is the failure mode this
+// package exists to avoid.
+type BodyLimitOption func(*bodyLimitConfig)
+
+type bodyLimitConfig struct {
+	tooLarge http.Handler
+}
+
+// WithMaxBodyErrorHandler replaces the response written when a request declares
+// a Content-Length larger than the limit. The default writes 413.
+//
+// This covers only the first of the two rejection paths described above. The
+// second one surfaces as a *http.MaxBytesError inside your handler and cannot
+// be routed here — setting this option without also handling that error leaves
+// the inconsistency it was meant to fix.
+//
+// A nil handler is ignored.
+func WithMaxBodyErrorHandler(h http.Handler) BodyLimitOption {
+	return func(c *bodyLimitConfig) {
+		if h != nil {
+			c.tooLarge = h
+		}
+	}
+}
+
+func (c bodyLimitConfig) writeTooLarge(w http.ResponseWriter, r *http.Request) {
+	if c.tooLarge != nil {
+		c.tooLarge.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
 }
 
 // RequireContentType returns middleware that rejects a body-carrying request
@@ -106,7 +179,15 @@ func MaxBodyBytes(n int64) func(http.Handler) http.Handler {
 //
 // Calling this with no media types rejects every body-carrying request, which
 // is the fail-closed reading of an empty allow-list.
-func RequireContentType(mediaTypes ...string) func(http.Handler) http.Handler {
+//
+// The rejection response is replaceable with [WithContentTypeErrorHandler].
+func RequireContentType(mediaTypes []string, opts ...ContentTypeOption) func(http.Handler) http.Handler {
+	var cfg contentTypeConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
 	// Normalize once, at construction: a typo or a stray parameter in the
 	// caller's list should not silently make the allow-list unmatchable.
 	allowed := make([]string, 0, len(mediaTypes))
@@ -129,7 +210,7 @@ func RequireContentType(mediaTypes ...string) func(http.Handler) http.Handler {
 			}
 			got, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 			if err != nil {
-				http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+				cfg.writeUnsupported(w, r)
 				return
 			}
 			for _, a := range allowed {
@@ -138,9 +219,42 @@ func RequireContentType(mediaTypes ...string) func(http.Handler) http.Handler {
 					return
 				}
 			}
-			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+			cfg.writeUnsupported(w, r)
 		})
 	}
+}
+
+// ContentTypeOption configures [RequireContentType]. See [BodyLimitOption] for
+// why the two constructors do not share one option type.
+type ContentTypeOption func(*contentTypeConfig)
+
+type contentTypeConfig struct {
+	unsupported http.Handler
+}
+
+// WithContentTypeErrorHandler replaces the response written when a request's
+// Content-Type is missing, malformed, or outside the allow-list. The default
+// writes 415.
+//
+// All three causes share one response, and a replacement should keep it that
+// way. Telling a client which of them applied describes the allow-list back to
+// whoever is probing it, one request at a time.
+//
+// A nil handler is ignored.
+func WithContentTypeErrorHandler(h http.Handler) ContentTypeOption {
+	return func(c *contentTypeConfig) {
+		if h != nil {
+			c.unsupported = h
+		}
+	}
+}
+
+func (c contentTypeConfig) writeUnsupported(w http.ResponseWriter, r *http.Request) {
+	if c.unsupported != nil {
+		c.unsupported.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
 }
 
 // methodHasBody reports whether a request method is one that carries a body and

@@ -88,7 +88,7 @@ func TestBurstThenBlock(t *testing.T) {
 	now := time.Now()
 
 	for i := range 5 {
-		res, err := store.Take(ctx, "client-a", cfg, now)
+		res, err := store.TakeN(ctx, "client-a", 1, cfg, now)
 		if err != nil {
 			t.Fatalf("take %d: %v", i, err)
 		}
@@ -100,7 +100,7 @@ func TestBurstThenBlock(t *testing.T) {
 		}
 	}
 
-	res, err := store.Take(ctx, "client-a", cfg, now)
+	res, err := store.TakeN(ctx, "client-a", 1, cfg, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,24 +123,24 @@ func TestRefill(t *testing.T) {
 	start := time.Now()
 
 	for range 2 {
-		if res, err := store.Take(ctx, "k", cfg, start); err != nil || !res.Allowed {
+		if res, err := store.TakeN(ctx, "k", 1, cfg, start); err != nil || !res.Allowed {
 			t.Fatalf("within burst: allowed=%v err=%v", res.Allowed, err)
 		}
 	}
-	if res, _ := store.Take(ctx, "k", cfg, start); res.Allowed {
+	if res, _ := store.TakeN(ctx, "k", 1, cfg, start); res.Allowed {
 		t.Fatal("past the burst was allowed")
 	}
 
 	// One second later, exactly one token has accrued.
-	if res, err := store.Take(ctx, "k", cfg, start.Add(time.Second)); err != nil || !res.Allowed {
+	if res, err := store.TakeN(ctx, "k", 1, cfg, start.Add(time.Second)); err != nil || !res.Allowed {
 		t.Errorf("after 1s: allowed=%v err=%v, want allowed", res.Allowed, err)
 	}
-	if res, _ := store.Take(ctx, "k", cfg, start.Add(time.Second)); res.Allowed {
+	if res, _ := store.TakeN(ctx, "k", 1, cfg, start.Add(time.Second)); res.Allowed {
 		t.Error("a second token appeared after only one refill period")
 	}
 
 	// A clock that moves backwards must not credit anything.
-	if res, _ := store.Take(ctx, "k", cfg, start.Add(-time.Hour)); res.Allowed {
+	if res, _ := store.TakeN(ctx, "k", 1, cfg, start.Add(-time.Hour)); res.Allowed {
 		t.Error("a backwards clock refilled the bucket")
 	}
 }
@@ -154,12 +154,12 @@ func TestKeysAreIndependent(t *testing.T) {
 	now := time.Now()
 
 	for _, key := range []string{"a", "b", "c"} {
-		if res, err := store.Take(ctx, key, cfg, now); err != nil || !res.Allowed {
+		if res, err := store.TakeN(ctx, key, 1, cfg, now); err != nil || !res.Allowed {
 			t.Fatalf("key %q: allowed=%v err=%v", key, res.Allowed, err)
 		}
 	}
 	for _, key := range []string{"a", "b", "c"} {
-		if res, _ := store.Take(ctx, key, cfg, now); res.Allowed {
+		if res, _ := store.TakeN(ctx, key, 1, cfg, now); res.Allowed {
 			t.Errorf("key %q was refilled by traffic on another key", key)
 		}
 	}
@@ -205,7 +205,7 @@ func TestConcurrencyIsAtomic(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start // release everything at once, to maximize overlap
-			res, err := store.Take(ctx, "hot-key", cfg, now)
+			res, err := store.TakeN(ctx, "hot-key", 1, cfg, now)
 			if err != nil {
 				failures.Add(1)
 				return
@@ -235,7 +235,7 @@ func TestKeysExpire(t *testing.T) {
 
 	ctx := context.Background()
 	cfg := ratelimit.Config{Burst: 3, PerSecond: 10} // refills in 300ms
-	if _, err := store.Take(ctx, "ephemeral", cfg, time.Now()); err != nil {
+	if _, err := store.TakeN(ctx, "ephemeral", 1, cfg, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -261,7 +261,7 @@ func TestTTLCoversTheRefillWindow(t *testing.T) {
 	ctx := context.Background()
 	// Refilling takes 100s, far longer than the 1s idle floor.
 	cfg := ratelimit.Config{Burst: 100, PerSecond: 1}
-	if _, err := store.Take(ctx, "slow", cfg, time.Now()); err != nil {
+	if _, err := store.TakeN(ctx, "slow", 1, cfg, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -283,13 +283,13 @@ func TestEvalShaAfterScriptFlush(t *testing.T) {
 	ctx := context.Background()
 	cfg := ratelimit.Config{Burst: 5, PerSecond: 1}
 
-	if _, err := store.Take(ctx, "k", cfg, time.Now()); err != nil {
+	if _, err := store.TakeN(ctx, "k", 1, cfg, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.ScriptFlush(ctx).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Take(ctx, "k", cfg, time.Now()); err != nil {
+	if _, err := store.TakeN(ctx, "k", 1, cfg, time.Now()); err != nil {
 		t.Errorf("Take after SCRIPT FLUSH: %v; the EVAL fallback did not fire", err)
 	}
 }
@@ -444,7 +444,7 @@ func TestSharedAcrossInstances(t *testing.T) {
 	}
 
 	if allowed != burst {
-		t.Errorf("allowed %d requests across two instances, want %d; the limit is not shared", allowed, burst)
+		t.Errorf("allowed %d requests across two instances, 1, want %d; the limit is not shared", allowed, burst)
 	}
 }
 
@@ -466,10 +466,10 @@ func TestKeyPrefixIsolation(t *testing.T) {
 	cfg := ratelimit.Config{Burst: 1, PerSecond: 0.001}
 	now := time.Now()
 
-	if res, _ := appA.Take(ctx, "same-key", cfg, now); !res.Allowed {
+	if res, _ := appA.TakeN(ctx, "same-key", 1, cfg, now); !res.Allowed {
 		t.Fatal("app A's first request was denied")
 	}
-	if res, _ := appB.Take(ctx, "same-key", cfg, now); !res.Allowed {
+	if res, _ := appB.TakeN(ctx, "same-key", 1, cfg, now); !res.Allowed {
 		t.Error("app B was throttled by app A's traffic; prefixes do not isolate")
 	}
 }
@@ -495,7 +495,7 @@ func TestKeysWithHostileContent(t *testing.T) {
 	}
 	for _, key := range keys {
 		t.Run(strconv.Quote(key), func(t *testing.T) {
-			res, err := store.Take(ctx, key, cfg, now)
+			res, err := store.TakeN(ctx, key, 1, cfg, now)
 			if err != nil {
 				t.Fatalf("Take(%q): %v", key, err)
 			}
@@ -520,11 +520,152 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := store.Take(ctx, "k", ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
+	_, err := store.TakeN(ctx, "k", 1, ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
 	if err == nil {
 		t.Fatal("Take succeeded with a cancelled context")
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want it to wrap context.Canceled", err)
+	}
+}
+
+// TestWeightedCost drives the cost argument against a real server, which is the
+// only place the Lua arithmetic is actually executed -- the unit tests use a
+// fake scripter and can only check that the argument is passed.
+func TestWeightedCost(t *testing.T) {
+	client, _ := startRedis(t)
+	store := newStore(t, client)
+
+	ctx := context.Background()
+	cfg := ratelimit.Config{Burst: 10, PerSecond: 1}
+	now := time.Now()
+
+	res, err := store.TakeN(ctx, "weighted", 7, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Allowed || res.Remaining != 3 {
+		t.Fatalf("TakeN(7) = %+v, want allowed with 3 remaining", res)
+	}
+
+	// All or nothing: a cost of 4 against 3 tokens must be refused and must not
+	// deduct partially, or the caller has paid for work it was denied.
+	res, err = store.TakeN(ctx, "weighted", 4, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Allowed {
+		t.Fatal("a cost of 4 was allowed with 3 tokens left")
+	}
+	if res.Remaining != 3 {
+		t.Errorf("remaining = %d after a denied call, want 3; the denial deducted", res.Remaining)
+	}
+	// The advertised retry must cover the whole cost, not one token: a client
+	// that comes back then must succeed rather than be rejected again.
+	if res.RetryAfter < time.Second {
+		t.Errorf("RetryAfter = %v, want at least 1s for the missing token", res.RetryAfter)
+	}
+
+	// Exactly the remaining balance succeeds.
+	res, err = store.TakeN(ctx, "weighted", 3, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Allowed || res.Remaining != 0 {
+		t.Errorf("TakeN(3) = %+v, want allowed with 0 remaining", res)
+	}
+}
+
+// TestCostAboveBurstIsDeniedNotErrored pins the Store contract: a cost the
+// bucket can never hold is a decision, not a malfunction, and it must not drain
+// what is there on its way to refusing.
+func TestCostAboveBurstIsDeniedNotErrored(t *testing.T) {
+	client, _ := startRedis(t)
+	store := newStore(t, client)
+
+	ctx := context.Background()
+	cfg := ratelimit.Config{Burst: 5, PerSecond: 1}
+	now := time.Now()
+
+	res, err := store.TakeN(ctx, "oversized", 6, cfg, now)
+	if err != nil {
+		t.Fatalf("an impossible cost returned an error rather than a denial: %v", err)
+	}
+	if res.Allowed {
+		t.Error("a cost above Burst was allowed")
+	}
+	if res.Remaining != 5 {
+		t.Errorf("remaining = %d, want 5; the refused call consumed tokens", res.Remaining)
+	}
+	if full, err := store.TakeN(ctx, "oversized", 5, cfg, now); err != nil || !full.Allowed {
+		t.Errorf("the bucket was not left intact: %+v, %v", full, err)
+	}
+}
+
+// TestCostBelowOneIsClamped pins that a miscomputed weight cannot buy a free
+// request through the script.
+func TestCostBelowOneIsClamped(t *testing.T) {
+	client, _ := startRedis(t)
+	store := newStore(t, client)
+
+	ctx := context.Background()
+	cfg := ratelimit.Config{Burst: 2, PerSecond: 0}
+	now := time.Now()
+
+	for i, n := range []int{0, -5} {
+		res, err := store.TakeN(ctx, "clamped", n, cfg, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Allowed {
+			t.Fatalf("call %d denied on a bucket with tokens left", i)
+		}
+		if want := 1 - i; res.Remaining != want {
+			t.Errorf("call %d: remaining = %d, want %d; the call was free", i, res.Remaining, want)
+		}
+	}
+	if res, _ := store.TakeN(ctx, "clamped", 1, cfg, now); res.Allowed {
+		t.Error("the bucket was not drained by two sub-unit calls")
+	}
+}
+
+// TestWeightedConcurrencyIsAtomic is the weighted version of the atomicity
+// property: twenty concurrent calls of cost 5 against a burst of 50 must admit
+// exactly ten, never eleven, no matter how the round trips interleave.
+func TestWeightedConcurrencyIsAtomic(t *testing.T) {
+	client, _ := startRedis(t)
+	store := newStore(t, client)
+
+	ctx := context.Background()
+	cfg := ratelimit.Config{Burst: 50, PerSecond: 0}
+	now := time.Now()
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	allowed := make(chan bool, goroutines)
+
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := store.TakeN(ctx, "concurrent-weighted", 5, cfg, now)
+			if err != nil {
+				allowed <- false
+				return
+			}
+			allowed <- res.Allowed
+		}()
+	}
+	wg.Wait()
+	close(allowed)
+
+	granted := 0
+	for ok := range allowed {
+		if ok {
+			granted++
+		}
+	}
+	if granted != 10 {
+		t.Errorf("granted = %d, want exactly 10 (50 tokens / cost 5)", granted)
 	}
 }

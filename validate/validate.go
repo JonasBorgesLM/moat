@@ -39,6 +39,7 @@ package validate
 import (
 	"fmt"
 	"net/mail"
+	"net/url"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -304,4 +305,138 @@ func NoHTMLTags() Rule {
 		}
 		return nil
 	}
+}
+
+// DefaultURLSchemes is the allow-list [URL] uses when called with no arguments.
+var DefaultURLSchemes = []string{"http", "https"}
+
+// URL rejects a value that is not an absolute URL with a scheme in the
+// allow-list. With no arguments the allow-list is [DefaultURLSchemes].
+//
+// # Threat
+//
+// A URL supplied by a user and later rendered into an href, a redirect, or an
+// image source is a script-execution primitive if its scheme is not
+// constrained. The two that matter:
+//
+//   - javascript: — clicking a link whose href is "javascript:fetch(...)" runs
+//     that code in your origin, with the victim's session. html/template will
+//     not save you here: it is contextual escaping, and inside an href a
+//     javascript: URL is a *valid* URL, not a syntax error to escape.
+//   - data: — "data:text/html,<script>..." renders attacker-authored HTML.
+//     Modern browsers block top-level navigation to it, but it still reaches
+//     iframes, and "should be blocked by the browser" is not an input policy.
+//
+// Constraining the scheme at the point of input is what makes the value safe
+// for every later use, rather than relying on each rendering site to remember.
+//
+// # Control characters, and who actually rejects them
+//
+// A browser removes tab, newline and carriage return from a URL before parsing
+// its scheme, so "java\tscript:alert(1)" navigates as javascript:. An
+// allow-list that compares the *parsed* scheme is the standard place this gets
+// through, because the parser and the browser disagree about what the scheme
+// even is.
+//
+// On current Go that bypass is closed by net/url itself: it refuses to parse a
+// URL containing an ASCII control character in the scheme, host or path, so the
+// disagreement never arises and this rule rejects the value on the parse error.
+// Verified exhaustively — see TestNetURLRejectsControlCharactersInScheme, which
+// is a canary: if a future Go becomes lenient there, it fails and tells you the
+// pre-check below has become load-bearing.
+//
+// The pre-check is kept anyway, for two reasons that are not hypothetical:
+//
+//   - It does not depend on net/url staying as strict as it is today. A
+//     security rule whose guarantee is a side effect of another package's
+//     current strictness is one upgrade away from not holding.
+//   - It rejects cases net/url does accept. Control characters in a *fragment*,
+//     and spaces in a path, query or trailing position, parse cleanly — they do
+//     not confuse the scheme, but they are not something a well-formed
+//     user-supplied URL contains, and accepting them means storing a value that
+//     renders differently in different consumers.
+//
+// # Scheme-relative URLs are rejected
+//
+// "//evil.example.com/path" parses with an empty scheme and is treated by a
+// browser as "same scheme as the current page", so it navigates off-site. It is
+// the classic open-redirect payload. A scheme is therefore required, which
+// rejects relative URLs generally — this rule is for absolute URLs, and a field
+// that should hold a path wants [Matches] with an anchored pattern instead.
+//
+// # What this rule does not do
+//
+// It does not check that the host is one you trust. An allowed scheme still
+// permits any host, so this is not sufficient on its own for a redirect target:
+// for that, compare the parsed host against a registered allow-list, which is
+// application knowledge this package does not have. It also does not perform
+// DNS resolution, so it is not an SSRF defense — a hostname that resolves to a
+// link-local address passes.
+//
+// Comparison is case-insensitive, as the URL grammar requires: "JaVaScRiPt:" is
+// the same scheme to a browser.
+//
+// An empty allow-list rejects every value, which is the fail-closed reading of
+// one, and matches how [OneOf] and [RequireContentType] treat the same mistake.
+func URL(schemes ...string) Rule {
+	allowed := DefaultURLSchemes
+	if len(schemes) > 0 {
+		allowed = make([]string, 0, len(schemes))
+		for _, s := range schemes {
+			allowed = append(allowed, strings.ToLower(strings.TrimSpace(s)))
+		}
+	}
+
+	return func(field, value string) error {
+		const invalid = "must be a valid URL"
+
+		if value == "" {
+			return newError(field, invalid)
+		}
+		if hasControlOrSpace(value) {
+			return newError(field, invalid)
+		}
+		if !utf8.ValidString(value) {
+			return newError(field, invalid)
+		}
+
+		u, err := url.Parse(value)
+		if err != nil {
+			return newError(field, invalid)
+		}
+		// An empty scheme is a relative or scheme-relative URL; see above.
+		if u.Scheme == "" {
+			return newError(field, invalid)
+		}
+		scheme := strings.ToLower(u.Scheme)
+		for _, a := range allowed {
+			if scheme == a {
+				// A hierarchical scheme with no host is not a usable absolute
+				// URL: "http:///path" and "https:" reach nothing, and letting
+				// them through means storing a value no later use can resolve.
+				if u.Host == "" {
+					return newError(field, invalid)
+				}
+				return nil
+			}
+		}
+		return newError(field, invalid)
+	}
+}
+
+// hasControlOrSpace reports whether s contains any ASCII control character,
+// space, or DEL.
+//
+// It runs before url.Parse deliberately. Browsers strip some of these before
+// reading the scheme, so a value that parses one way here can navigate another
+// way there; rejecting outright avoids having to model that divergence. It is a
+// named function rather than an inline loop so that it can be tested directly,
+// independently of what net/url happens to reject in any given Go release.
+func hasControlOrSpace(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }

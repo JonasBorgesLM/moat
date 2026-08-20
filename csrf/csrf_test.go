@@ -1,29 +1,34 @@
 package csrf_test
 
 import (
+	"bufio"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/JonasBorgesLM/moat/csrf"
+	"github.com/JonasBorgesLM/moat/secret"
 )
 
 const testHost = "app.example.com"
 
-func testSecret(t *testing.T) []byte {
+func testSecret(t *testing.T) secret.Value {
 	t.Helper()
-	secret, err := csrf.GenerateSecret()
+	v, err := csrf.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return secret
+	return v
 }
 
 // echoHandler reports the token it can see, so tests can check that a token is
@@ -125,14 +130,14 @@ func post(t *testing.T, p *csrf.Protector, o postOpts) *httptest.ResponseRecorde
 func TestNew(t *testing.T) {
 	tests := []struct {
 		name    string
-		secret  []byte
+		secret  secret.Value
 		wantErr error
 	}{
-		{"a 32-byte secret is accepted", make([]byte, 32), nil},
-		{"a longer secret is accepted", make([]byte, 64), nil},
-		{"31 bytes is rejected", make([]byte, 31), csrf.ErrSecretTooShort},
-		{"an empty secret is rejected", nil, csrf.ErrSecretTooShort},
-		{"a short human-chosen secret is rejected", []byte("hunter2"), csrf.ErrSecretTooShort},
+		{"a 32-byte secret is accepted", secret.New(make([]byte, 32)), nil},
+		{"a longer secret is accepted", secret.New(make([]byte, 64)), nil},
+		{"31 bytes is rejected", secret.New(make([]byte, 31)), csrf.ErrSecretTooShort},
+		{"an empty secret is rejected", secret.Value{}, csrf.ErrSecretTooShort},
+		{"a short human-chosen secret is rejected", secret.New([]byte("hunter2")), csrf.ErrSecretTooShort},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,17 +153,21 @@ func TestNew(t *testing.T) {
 }
 
 // TestNewCopiesTheSecret checks that mutating the caller's slice afterwards
-// cannot change how tokens verify.
+// cannot change how tokens verify. secret.Value copies on the way in and on the
+// way out, so a caller holding either slice cannot reach the Protector's key.
 func TestNewCopiesTheSecret(t *testing.T) {
-	secret := testSecret(t)
-	p, err := csrf.New(secret)
+	key := testSecret(t)
+	p, err := csrf.New(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cookie, token := issue(t, p)
 
-	for i := range secret {
-		secret[i] = 0
+	// Mutate the bytes the caller can still see, both from the Value and from
+	// the slice New was handed.
+	raw := key.Bytes()
+	for i := range raw {
+		raw[i] = 0
 	}
 
 	if rec := post(t, p, postOpts{cookie: cookie, headerToken: token}); rec.Code != http.StatusOK {
@@ -171,19 +180,45 @@ func TestGenerateSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(a) != csrf.MinSecretLen {
-		t.Errorf("len = %d, want %d", len(a), csrf.MinSecretLen)
+	if a.Len() != csrf.MinSecretLen {
+		t.Errorf("len = %d, want %d", a.Len(), csrf.MinSecretLen)
 	}
 	b, err := csrf.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(a) == string(b) {
+	if a.Equal(b) {
 		t.Error("two generated secrets are identical")
 	}
 	// It must be usable directly, with no further processing.
 	if _, err := csrf.New(a); err != nil {
 		t.Errorf("New rejected a generated secret: %v", err)
+	}
+}
+
+// TestGeneratedSecretDoesNotPrint is the reason GenerateSecret returns a
+// secret.Value rather than a []byte: the value it hands back must survive
+// contact with the formatting and logging paths an application will inevitably
+// point at its config.
+func TestGeneratedSecretDoesNotPrint(t *testing.T) {
+	v, err := csrf.GenerateSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(v.Bytes())
+
+	for _, out := range []string{
+		fmt.Sprintf("%v", v),
+		fmt.Sprintf("%+v", v),
+		fmt.Sprintf("%#v", v),
+		fmt.Sprintf("%s", v),
+		fmt.Sprintf("%x", v),
+		fmt.Sprintf("%d", v),
+		fmt.Sprintf("%v", struct{ Secret secret.Value }{v}),
+	} {
+		if strings.Contains(out, raw) {
+			t.Errorf("a generated secret leaked through formatting: %s", out)
+		}
 	}
 }
 
@@ -241,6 +276,12 @@ func token(t *testing.T, rec *httptest.ResponseRecorder) string {
 
 // TestExistingCookieIsReused checks that a valid cookie is not replaced on
 // every request, which would invalidate any form already rendered.
+//
+// It is the *cookie* that must be stable, not the token. Tokens carry a fresh
+// one-time pad per response and are expected to differ every time; the property
+// that matters is that both encodings still verify against the one cookie. An
+// earlier version of this test asserted the token bytes were identical, which
+// is exactly the BREACH precondition the masking removed.
 func TestExistingCookieIsReused(t *testing.T) {
 	p, err := csrf.New(testSecret(t))
 	if err != nil {
@@ -254,11 +295,18 @@ func TestExistingCookieIsReused(t *testing.T) {
 	r.AddCookie(cookie)
 	p.Middleware(echoHandler()).ServeHTTP(rec, r)
 
-	if got := rec.Body.String(); got != first {
-		t.Errorf("token changed on a request that already had a cookie: %q then %q", first, got)
-	}
+	second := rec.Body.String()
 	if cookies := rec.Result().Cookies(); len(cookies) != 0 {
 		t.Errorf("re-issued %d cookies for a request that already had one", len(cookies))
+	}
+	if second == first {
+		t.Error("the token was byte-identical across two responses; the per-response mask is not being applied")
+	}
+	// Both must verify against the same cookie.
+	for name, tok := range map[string]string{"first": first, "second": second} {
+		if rec := post(t, p, postOpts{cookie: cookie, headerToken: tok}); rec.Code != http.StatusOK {
+			t.Errorf("the %s token did not verify against the reused cookie: status %d", name, rec.Code)
+		}
 	}
 }
 
@@ -653,8 +701,14 @@ func TestTokenAvailableOnRejectedRequests(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
-	if seen != tok {
-		t.Errorf("error handler saw token %q, want %q", seen, tok)
+	// The token handed to the error handler is minted for *this* response, so
+	// it is a different encoding from the one issued earlier. What the handler
+	// needs is a token that works, not a particular string.
+	if seen == "" {
+		t.Fatal("the error handler saw no token; a form re-rendered after a failure would have none")
+	}
+	if again := post(t, p, postOpts{cookie: cookie, headerToken: seen}); again.Code != http.StatusOK {
+		t.Errorf("the token given to the error handler does not verify: status %d", again.Code)
 	}
 }
 
@@ -756,7 +810,7 @@ func TestCookieOptions(t *testing.T) {
 			r.Host = testHost
 			p.Middleware(echoHandler()).ServeHTTP(rec, r)
 
-			c := rec.Result().Cookies()[0]
+			c := lastCookie(t, rec)
 			if c.Name != tc.wantName {
 				t.Errorf("Name = %q, want %q", c.Name, tc.wantName)
 			}
@@ -870,9 +924,9 @@ var formTemplate = template.Must(template.New("form").Parse(
 func ExampleNew() {
 	// In production, load this from your secret store. It must be identical on
 	// every instance and stable across deploys.
-	secret := []byte("a-32-byte-or-longer-secret-value")
+	key := secret.New([]byte("a-32-byte-or-longer-secret-value"))
 
-	protector, err := csrf.New(secret)
+	protector, err := csrf.New(key)
 	if err != nil {
 		fmt.Println("csrf:", err)
 		return
@@ -905,15 +959,26 @@ func ExampleNew() {
 	// Output: 200 true
 }
 
-// ExampleGenerateSecret returns a secret and never prints it. Store the result
-// the way you store other secrets.
+// ExampleGenerateSecret returns a secret and never prints it. The secret.Value
+// wrapper means that stays true even if you try: printing it yields the
+// placeholder, and the bytes come out only through an explicit Bytes call.
 func ExampleGenerateSecret() {
-	secret, err := csrf.GenerateSecret()
+	key, err := csrf.GenerateSecret()
 	if err != nil {
 		return
 	}
-	fmt.Println(len(secret))
-	// Output: 32
+
+	fmt.Println(key.Len(), "bytes")
+	fmt.Printf("printing it gives %v\n", key)
+
+	// Hand it straight to New; there is no reason to unwrap it here.
+	if _, err := csrf.New(key); err != nil {
+		fmt.Println("csrf:", err)
+	}
+
+	// Output:
+	// 32 bytes
+	// printing it gives [REDACTED]
 }
 
 // ExampleToken shows the two-value form. The bool is what stops a missing
@@ -927,4 +992,597 @@ func ExampleToken() {
 	// No middleware in front, so no token.
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	// Output: true false
+}
+
+// --- Rotate ------------------------------------------------------------------
+
+// lastCookie returns the cookie a browser would end up holding: when the
+// middleware minted one and Rotate then replaced it, both are on the response
+// and the last wins.
+func lastCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("no cookies were set")
+	}
+	return cookies[len(cookies)-1]
+}
+
+// loginHandler simulates a privilege change: it rotates and reports the token
+// Token(r) sees afterwards, which is what a real handler would render.
+func loginHandler(t *testing.T, p *csrf.Protector, rotErr *error) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := p.Rotate(w, r)
+		if rotErr != nil {
+			*rotErr = err
+		}
+		if err != nil {
+			http.Error(w, "rotate failed", http.StatusInternalServerError)
+			return
+		}
+		token, ok := csrf.Token(r)
+		if !ok {
+			http.Error(w, "no token", http.StatusInternalServerError)
+			return
+		}
+		// #nosec G705 -- a library-generated CSRF token written as plain text so
+		// the test client can submit it; not attacker-controlled and not HTML.
+		_, _ = w.Write([]byte(token))
+	})
+}
+
+// TestRotateInvalidatesTheOldToken is the fixation defence: a token computed
+// from the pre-login cookie must stop verifying once the privilege level
+// changes.
+func TestRotateInvalidatesTheOldToken(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// What an attacker who planted the cookie would hold.
+	oldCookie, oldToken := issue(t, p)
+
+	// The victim logs in; the handler rotates.
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+	r.AddCookie(oldCookie)
+	p.Middleware(loginHandler(t, p, nil)).ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login returned %d: %s", rec.Code, rec.Body)
+	}
+	newCookie := lastCookie(t, rec)
+	newToken := rec.Body.String()
+
+	if newCookie.Value == oldCookie.Value {
+		t.Fatal("the cookie value was not rotated")
+	}
+	if newToken == oldToken {
+		t.Fatal("the token was not rotated")
+	}
+
+	// The property that actually defeats fixation: the victim's browser now
+	// sends newCookie, and the token the attacker precomputed does not match
+	// it. (The old pair still verifies against itself -- this scheme is
+	// stateless and has nothing to revoke -- but presenting it requires the
+	// attacker's own browser and their own session, which is not the attack.)
+	if got := post(t, p, postOpts{cookie: newCookie, headerToken: oldToken}); got.Code == http.StatusOK {
+		t.Error("the old token verified against the new cookie")
+	}
+	if got := post(t, p, postOpts{cookie: oldCookie, headerToken: newToken}); got.Code == http.StatusOK {
+		t.Error("the new token verified against the old cookie")
+	}
+	// And the new pair works.
+	if got := post(t, p, postOpts{cookie: newCookie, headerToken: newToken}); got.Code != http.StatusOK {
+		t.Errorf("the rotated pair was rejected: %d", got.Code)
+	}
+}
+
+// TestRotateIsNotServerSideRevocation pins the documented limit of the
+// stateless design, so the doc comment cannot drift into claiming more than the
+// scheme can deliver.
+func TestRotateIsNotServerSideRevocation(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCookie, oldToken := issue(t, p)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+	r.AddCookie(oldCookie)
+	p.Middleware(loginHandler(t, p, nil)).ServeHTTP(rec, r)
+
+	if got := post(t, p, postOpts{cookie: oldCookie, headerToken: oldToken}); got.Code != http.StatusOK {
+		t.Errorf("the old self-consistent pair was rejected (%d); the scheme has become "+
+			"stateful, or Rotate now revokes -- either way §4.3 and the Rotate doc need updating", got.Code)
+	}
+}
+
+// TestTokenAfterRotateIsTheNewOne is the trap the holder indirection exists to
+// close: a stale Token(r) would render the old value into the page and break
+// every subsequent POST.
+func TestTokenAfterRotateIsTheNewOne(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		before, _ = csrf.Token(r)
+		if _, err := p.Rotate(w, r); err != nil {
+			t.Errorf("Rotate: %v", err)
+			return
+		}
+		after, _ = csrf.Token(r)
+	})
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+	p.Middleware(h).ServeHTTP(rec, r)
+
+	if before == "" || after == "" {
+		t.Fatalf("tokens missing: before=%q after=%q", before, after)
+	}
+	if before == after {
+		t.Fatal("Token still reports the pre-rotation value; the page would render a dead token")
+	}
+
+	// And it must be the token that matches the cookie now on the response.
+	if got := post(t, p, postOpts{cookie: lastCookie(t, rec), headerToken: after}); got.Code != http.StatusOK {
+		t.Errorf("the post-rotation token does not match the new cookie: %d", got.Code)
+	}
+}
+
+// TestRotateReturnsTheSameTokenTokenReports guards against the return value and
+// the context drifting apart.
+func TestRotateReturnsTheSameTokenTokenReports(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var returned, fromContext string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		returned, _ = p.Rotate(w, r)
+		fromContext, _ = csrf.Token(r)
+	})
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+	p.Middleware(h).ServeHTTP(rec, r)
+
+	if returned != fromContext {
+		t.Errorf("Rotate returned %q but Token reports %q", returned, fromContext)
+	}
+}
+
+// TestRotateWithoutMiddleware covers a login route mounted outside the
+// protected chain: there is no holder to update, so the return value is the
+// only channel, and it must still be usable.
+func TestRotateWithoutMiddleware(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+
+	token, err := p.Rotate(rec, r)
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if token == "" {
+		t.Fatal("Rotate returned an empty token")
+	}
+	// Token reports nothing, because the middleware never ran -- and that is
+	// the honest answer rather than a silent empty string.
+	if got, ok := csrf.Token(r); ok || got != "" {
+		t.Errorf("Token = %q, %v; want empty and false without the middleware", got, ok)
+	}
+
+	if got := post(t, p, postOpts{cookie: lastCookie(t, rec), headerToken: token}); got.Code != http.StatusOK {
+		t.Errorf("the rotated pair from outside the chain was rejected: %d", got.Code)
+	}
+}
+
+// TestRotateCookieKeepsItsAttributes: a rotated cookie that lost Secure,
+// HttpOnly or SameSite would quietly downgrade the protection at exactly the
+// moment the session becomes valuable.
+func TestRotateCookieKeepsItsAttributes(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+	if _, err := p.Rotate(rec, r); err != nil {
+		t.Fatal(err)
+	}
+
+	c := lastCookie(t, rec)
+	if !c.Secure {
+		t.Error("the rotated cookie is not Secure")
+	}
+	if !c.HttpOnly {
+		t.Error("the rotated cookie is not HttpOnly")
+	}
+	if c.SameSite != http.SameSiteLaxMode {
+		t.Errorf("SameSite = %v, want Lax", c.SameSite)
+	}
+	if c.Path != "/" {
+		t.Errorf("Path = %q, want /", c.Path)
+	}
+	if !strings.HasPrefix(c.Name, "__Host-") {
+		t.Errorf("name = %q, want the __Host- prefix", c.Name)
+	}
+}
+
+func TestRotateRejectsNilArguments(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "https://"+testHost+"/login", nil)
+
+	if _, err := p.Rotate(nil, r); err == nil {
+		t.Error("Rotate(nil, r) returned no error")
+	}
+	if _, err := p.Rotate(httptest.NewRecorder(), nil); err == nil {
+		t.Error("Rotate(w, nil) returned no error")
+	}
+}
+
+// TestRotateIsConcurrencySafe covers a handler that hands the request to
+// goroutines, which is why the holder carries a mutex.
+func TestRotateIsConcurrencySafe(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = csrf.Token(r)
+			}()
+		}
+		// Rotate concurrently with the readers. Under -race this is where a
+		// plain string in the context would be caught.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = p.Rotate(httptest.NewRecorder(), r)
+		}()
+		wg.Wait()
+	})
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+	p.Middleware(h).ServeHTTP(rec, r)
+}
+
+// TestRotateAfterWriteHeaderIsReported is the detection requirement: calling
+// Rotate too late must fail loudly, because net/http drops a Set-Cookie added
+// after the header block is serialized and the handler would otherwise believe
+// it had rotated.
+func TestRotateAfterWriteHeaderIsReported(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		begin func(w http.ResponseWriter)
+	}{
+		{"explicit WriteHeader", func(w http.ResponseWriter) { w.WriteHeader(http.StatusOK) }},
+		{"implicit via Write", func(w http.ResponseWriter) { _, _ = w.Write([]byte("hello")) }},
+		{"a redirect", func(w http.ResponseWriter) {
+			http.Redirect(w, httptest.NewRequest(http.MethodGet, "/", nil), "/", http.StatusSeeOther)
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var rotErr error
+			var token string
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tc.begin(w)
+				token, rotErr = p.Rotate(w, r)
+			})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+			req.Host = testHost
+			p.Middleware(h).ServeHTTP(rec, req)
+
+			if !errors.Is(rotErr, csrf.ErrHeadersAlreadySent) {
+				t.Fatalf("Rotate error = %v, want ErrHeadersAlreadySent", rotErr)
+			}
+			if token != "" {
+				t.Errorf("Rotate returned token %q alongside an error", token)
+			}
+			// And it must genuinely have changed nothing: the only cookie on
+			// the response is the one the middleware minted.
+			if n := len(rec.Result().Cookies()); n != 1 {
+				t.Errorf("response carries %d cookies, want 1; the late Rotate wrote one anyway", n)
+			}
+		})
+	}
+}
+
+// TestRotateBeforeWriteHeaderStillWorks is the control for the test above: the
+// detection must not fire on the correct ordering.
+func TestRotateBeforeWriteHeaderStillWorks(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rotErr error
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, rotErr = p.Rotate(w, r)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/login", nil)
+	req.Host = testHost
+	p.Middleware(h).ServeHTTP(rec, req)
+
+	if rotErr != nil {
+		t.Fatalf("Rotate on the correct ordering failed: %v", rotErr)
+	}
+}
+
+// flushHijacker is a ResponseWriter with the optional capabilities a streaming
+// or upgrading handler needs, so the test can prove they survive the wrapper.
+type flushHijacker struct {
+	http.ResponseWriter
+	flushed  bool
+	hijacked bool
+}
+
+func (f *flushHijacker) Flush() { f.flushed = true }
+
+func (f *flushHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	f.hijacked = true
+	return nil, nil, nil
+}
+
+// TestMiddlewareDoesNotHideFlusherOrHijacker pins that wrapping the
+// ResponseWriter does not cost the rest of the chain its capabilities.
+// http.ResponseController follows the Unwrap convention to reach them.
+func TestMiddlewareDoesNotHideFlusherOrHijacker(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	underlying := &flushHijacker{ResponseWriter: httptest.NewRecorder()}
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		if err := rc.Flush(); err != nil {
+			t.Errorf("ResponseController.Flush through the wrapper: %v", err)
+		}
+		if _, _, err := rc.Hijack(); err != nil {
+			t.Errorf("ResponseController.Hijack through the wrapper: %v", err)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/stream", nil)
+	req.Host = testHost
+	p.Middleware(h).ServeHTTP(underlying, req)
+
+	if !underlying.flushed {
+		t.Error("Flush did not reach the underlying ResponseWriter")
+	}
+	if !underlying.hijacked {
+		t.Error("Hijack did not reach the underlying ResponseWriter")
+	}
+}
+
+// TestRotateOutsideTheChainStillRotates pins that the late-call detection is a
+// safety net and cannot disable the thing it guards: with no wrapper to consult,
+// rotation must still happen.
+func TestRotateOutsideTheChainStillRotates(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "https://"+testHost+"/login", nil)
+	r.Host = testHost
+
+	token, err := p.Rotate(rec, r)
+	if err != nil {
+		t.Fatalf("Rotate outside the chain: %v", err)
+	}
+	if token == "" {
+		t.Fatal("Rotate returned an empty token")
+	}
+	if got := post(t, p, postOpts{cookie: lastCookie(t, rec), headerToken: token}); got.Code != http.StatusOK {
+		t.Errorf("the rotated pair was rejected: %d", got.Code)
+	}
+}
+
+// TestTokenIsMaskedPerResponse is the R4 MEDIUM-1 regression.
+//
+// An unmasked token is a pure function of the cookie, so it is byte-identical in
+// every response until the cookie rotates. That is the precondition for BREACH:
+// an app serving compressed HTML that reflects any attacker-influenced string
+// into the same response becomes an adaptive compression oracle, and a constant
+// secret in that response is recoverable byte by byte. The mask removes the
+// constant.
+//
+// NEGATIVE CONTROL: make maskToken return
+// base64.RawURLEncoding.EncodeToString(raw) and unmaskToken decode it
+// symmetrically — the pre-fix design — and the distinctness assertion fails on
+// the second response. Verified red.
+func TestTokenIsMaskedPerResponse(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, _ := issue(t, p)
+
+	const responses = 25
+	seen := make(map[string]int, responses)
+	for i := range responses {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/", nil)
+		r.Host = testHost
+		r.AddCookie(cookie)
+		p.Middleware(echoHandler()).ServeHTTP(rec, r)
+
+		tok := rec.Body.String()
+		if first, dup := seen[tok]; dup {
+			t.Fatalf("response %d repeated the token from response %d: the token is a constant across responses, which is what BREACH extracts", i, first)
+		}
+		seen[tok] = i
+
+		// Distinct is worthless if they stop working.
+		if got := post(t, p, postOpts{cookie: cookie, headerToken: tok}); got.Code != http.StatusOK {
+			t.Fatalf("token from response %d did not verify: status %d", i, got.Code)
+		}
+	}
+
+	// The masking must not be a rename: no two encodings may share the pad half
+	// either, or the oracle just moves to the other half.
+	pads := make(map[string]bool, responses)
+	for tok := range seen {
+		raw, err := base64.RawURLEncoding.DecodeString(tok)
+		if err != nil {
+			t.Fatalf("token is not valid base64url: %v", err)
+		}
+		if len(raw) != 64 {
+			t.Fatalf("token decoded to %d bytes, want 64 (32-byte pad + 32-byte masked MAC)", len(raw))
+		}
+		if pads[string(raw[:32])] {
+			t.Error("two responses reused the same pad")
+		}
+		pads[string(raw[:32])] = true
+	}
+}
+
+// TestRotateIssuesAUsableMaskedToken checks the half of the format change that
+// is easy to miss: Rotate mints its own token and must produce the same shape
+// the middleware does, against the cookie it just set.
+func TestRotateIssuesAUsableMaskedToken(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rotated string
+	var rotErr error
+	h := p.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rotated, rotErr = p.Rotate(w, r)
+	}))
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+testHost+"/", nil)
+	r.Host = testHost
+	h.ServeHTTP(rec, r)
+	if rotErr != nil {
+		t.Fatalf("Rotate: %v", rotErr)
+	}
+
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("Rotate set no cookie")
+	}
+	newCookie := cookies[len(cookies)-1]
+
+	if got := post(t, p, postOpts{cookie: newCookie, headerToken: rotated}); got.Code != http.StatusOK {
+		t.Errorf("the rotated token did not verify against the rotated cookie: status %d", got.Code)
+	}
+	// And Token(r) inside the same request must agree with what Rotate returned.
+	if raw, err := base64.RawURLEncoding.DecodeString(rotated); err != nil || len(raw) != 64 {
+		t.Errorf("Rotate returned a token of the wrong shape (%d bytes, err %v)", len(raw), err)
+	}
+}
+
+// TestMalformedTokenIsRejected covers the parse the mask introduced. Every input
+// here is attacker-supplied, so none of these paths may accept, and none of them
+// consults the secret.
+func TestMalformedTokenIsRejected(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, tok := issue(t, p)
+
+	raw, err := base64.RawURLEncoding.DecodeString(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]string{
+		"empty":                  "",
+		"not base64":             "!!!!not-base64!!!!",
+		"too short":              base64.RawURLEncoding.EncodeToString(raw[:32]),
+		"too long":               base64.RawURLEncoding.EncodeToString(append(append([]byte(nil), raw...), 0)),
+		"pad only":               base64.RawURLEncoding.EncodeToString(raw[:32]),
+		"the bare unmasked MAC":  base64.RawURLEncoding.EncodeToString(raw[32:]),
+		"one bit flipped in pad": base64.RawURLEncoding.EncodeToString(append([]byte{raw[0] ^ 1}, raw[1:]...)),
+	}
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			if rec := post(t, p, postOpts{cookie: cookie, headerToken: bad}); rec.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403", rec.Code)
+			}
+		})
+	}
+}
+
+// TestManyEncodingsOfOneTokenAreAllValid records a property of the masking that
+// looks like a flaw and is not, so that nobody "fixes" it later.
+//
+// Because the mask is an XOR, every pair (pad, mac^pad) encodes the same MAC —
+// swapping the two halves is just another valid encoding, and there are 2^256 of
+// them. That is the point: the token has no canonical form, which is what stops
+// two responses from sharing bytes. It grants an attacker nothing, because
+// producing another encoding requires already holding one, and holding one is
+// the thing being protected.
+//
+// What must not be forgeable is an encoding of a MAC the attacker does not have,
+// and TestMalformedTokenIsRejected covers that: flipping a bit anywhere changes
+// the recovered MAC and is refused.
+func TestManyEncodingsOfOneTokenAreAllValid(t *testing.T) {
+	p, err := csrf.New(testSecret(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, tok := issue(t, p)
+	raw, err := base64.RawURLEncoding.DecodeString(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	swapped := base64.RawURLEncoding.EncodeToString(append(append([]byte(nil), raw[32:]...), raw[:32]...))
+	if swapped == tok {
+		t.Fatal("the two halves happened to be equal; pick another secret")
+	}
+	if rec := post(t, p, postOpts{cookie: cookie, headerToken: swapped}); rec.Code != http.StatusOK {
+		t.Errorf("a re-encoding of the same MAC was refused: status %d", rec.Code)
+	}
 }

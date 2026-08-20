@@ -1,6 +1,7 @@
 package pathguard_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -675,4 +676,115 @@ func ExampleGuard_ResolveNew() {
 	// Output:
 	// upload destination accepted
 	// traversal rejected
+}
+
+// envelopeHandler writes the {"error": ...} shape an application with its own
+// error contract would use.
+func envelopeHandler(status int, msg string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	})
+}
+
+func TestFileServerHandlerOptions(t *testing.T) {
+	g := newGuard(t)
+
+	srv := g.FileServer(
+		pathguard.WithNotFoundHandler(envelopeHandler(http.StatusNotFound, "not found")),
+		pathguard.WithMethodNotAllowedHandler(envelopeHandler(http.StatusMethodNotAllowed, "bad method")),
+	)
+
+	tests := []struct {
+		name       string
+		method     string
+		target     string
+		wantStatus int
+		wantBody   string
+	}{
+		{"a missing file", http.MethodGet, "/nope.txt", http.StatusNotFound, `"error":"not found"`},
+		{"a dot path", http.MethodGet, "/.env", http.StatusNotFound, `"error":"not found"`},
+		{"a directory", http.MethodGet, "/", http.StatusNotFound, `"error":"not found"`},
+		{"a traversal attempt", http.MethodGet, "/../secret", http.StatusNotFound, `"error":"not found"`},
+		{"a disallowed method", http.MethodPost, "/index.txt", http.StatusMethodNotAllowed, `"error":"bad method"`},
+		{"a disallowed method on a missing file", http.MethodDelete, "/nope.txt", http.StatusMethodNotAllowed, `"error":"bad method"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.target, nil))
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", got)
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantBody) {
+				t.Errorf("body = %q, want it to contain %q", rec.Body, tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestCustomMethodNotAllowedKeepsAllow pins that the Allow header is set before
+// the custom handler runs, so a replacement cannot accidentally emit a 405 that
+// is not conformant.
+func TestCustomMethodNotAllowedKeepsAllow(t *testing.T) {
+	g := newGuard(t)
+	srv := g.FileServer(pathguard.WithMethodNotAllowedHandler(
+		envelopeHandler(http.StatusMethodNotAllowed, "bad method")))
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/index.txt", nil))
+
+	if got := rec.Header().Get("Allow"); got != "GET, HEAD" {
+		t.Errorf("Allow = %q, want %q", got, "GET, HEAD")
+	}
+}
+
+// TestFileServerOptionsDefaultAndNil pins that FileServer with no options, and
+// with nil ones, still writes the built-in responses. A failed constructor
+// upstream must not silently remove a rejection.
+func TestFileServerOptionsDefaultAndNil(t *testing.T) {
+	g := newGuard(t)
+
+	for name, srv := range map[string]http.Handler{
+		"no options":   g.FileServer(),
+		"nil options":  g.FileServer(nil),
+		"nil handlers": g.FileServer(pathguard.WithNotFoundHandler(nil), pathguard.WithMethodNotAllowedHandler(nil)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope.txt", nil))
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("missing file status = %d, want 404", rec.Code)
+			}
+
+			rec = httptest.NewRecorder()
+			srv.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/index.txt", nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("bad method status = %d, want 405", rec.Code)
+			}
+		})
+	}
+}
+
+// TestCustomNotFoundStillServesRealFiles guards against an option that
+// accidentally short-circuits the success path.
+func TestCustomNotFoundStillServesRealFiles(t *testing.T) {
+	g := newGuard(t)
+	srv := g.FileServer(pathguard.WithNotFoundHandler(envelopeHandler(http.StatusNotFound, "not found")))
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/index.txt", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "index" {
+		t.Errorf("body = %q, want the file contents", rec.Body)
+	}
 }

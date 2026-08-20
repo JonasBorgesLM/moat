@@ -48,6 +48,8 @@ import (
 	"github.com/JonasBorgesLM/moat/csrf"
 	"github.com/JonasBorgesLM/moat/middleware"
 	"github.com/JonasBorgesLM/moat/ratelimit"
+	"github.com/JonasBorgesLM/moat/realip"
+	"github.com/JonasBorgesLM/moat/secret"
 	"github.com/JonasBorgesLM/moat/secureheaders"
 	"github.com/JonasBorgesLM/moat/validate"
 )
@@ -72,6 +74,33 @@ var (
 	// ErrMissingRateLimit reports that no rate limit was supplied and
 	// DisableRateLimit was not set.
 	ErrMissingRateLimit = errors.New("preset: RateLimitBurst and RateLimitPerSec are required unless DisableRateLimit is set")
+
+	// ErrProxyTopologyUnspecified reports that rate limiting is enabled but the
+	// chain was told neither which proxies to trust nor that the service is
+	// directly exposed.
+	//
+	// # Why this cannot be defaulted
+	//
+	// A rate limiter is only as good as the identity it counts against. With no
+	// answer here the limiter would fall back to r.RemoteAddr, which behind a
+	// load balancer is the balancer's address for every client on earth — so
+	// every client shares one bucket and any single one of them can hold the
+	// whole service at its limit indefinitely. That is not a bypass, it is
+	// denial of service against everyone else, and it looks exactly like
+	// ordinary throttling from the outside, which is what makes it so bad a
+	// default to ship silently.
+	//
+	// The opposite guess is no better: reading X-Forwarded-For without knowing
+	// which peer is allowed to set it lets each request choose its own identity,
+	// which removes the limit entirely. There is no safe default because the
+	// answer is a fact about your deployment that only you have.
+	//
+	// Answer it with [Config.TrustedProxies] or, if nothing sits in front of
+	// this server, with [Config.DirectlyExposed]. Refusing an empty
+	// TrustedProxies outright would be the wrong shape: it would break the
+	// legitimate direct deployment and push an operator to type something —
+	// anything — to make startup succeed, which is worse than what it replaced.
+	ErrProxyTopologyUnspecified = errors.New("preset: set TrustedProxies to your proxy CIDRs, or DirectlyExposed if nothing fronts this server; without one the rate limiter counts every client as the same client")
 )
 
 // Config parameterizes [API].
@@ -82,10 +111,15 @@ var (
 type Config struct {
 	// CSRFSecret is the server secret used to sign CSRF tokens. It must be at
 	// least csrf.MinSecretLen bytes, identical across every instance, and
-	// stable across deploys. Generate one with csrf.GenerateSecret.
+	// stable across deploys. Generate one with csrf.GenerateSecret, or wrap
+	// bytes from your secret store with secret.New.
+	//
+	// It is a secret.Value so that a Config dumped with %+v, marshalled into a
+	// startup log line, or passed to slog.Any does not carry the signing key
+	// with it. A Config is exactly the kind of struct that gets logged.
 	//
 	// Required unless DisableCSRF is set.
-	CSRFSecret []byte
+	CSRFSecret secret.Value
 
 	// DisableCSRF omits CSRF protection.
 	//
@@ -110,6 +144,34 @@ type Config struct {
 	// Reasonable when limiting happens upstream, at a load balancer or an API
 	// gateway. Not reasonable because the numbers were inconvenient to pick.
 	DisableRateLimit bool
+
+	// TrustedProxies lists the CIDRs of the reverse proxies in front of this
+	// server — the load balancer, ingress or CDN — in the form realip.New
+	// accepts ("10.0.0.0/8", "2001:db8::/32", or a bare address for a single
+	// host).
+	//
+	// When set, the rate limiter keys on the client address derived by realip
+	// rather than on r.RemoteAddr, so clients arriving through one balancer are
+	// counted separately instead of sharing a bucket. Set it to your *proxies*,
+	// never to your clients: a client range here would let requests from it
+	// choose their own identity.
+	//
+	// Required unless [Config.DirectlyExposed] is set, and only when rate
+	// limiting is enabled. See [ErrProxyTopologyUnspecified].
+	TrustedProxies []string
+
+	// DirectlyExposed states that no proxy sits in front of this server, so
+	// r.RemoteAddr already is the client.
+	//
+	// It is the alternative to [Config.TrustedProxies], not a way to skip the
+	// question. It exists as a named field for the same reason
+	// [Config.DisableCSRF] does: the claim is a real one about your deployment,
+	// it is wrong for most production topologies, and it should be visible to
+	// whoever reviews the diff. If it is set while the service is in fact behind
+	// a balancer, every client shares one rate-limit bucket.
+	//
+	// Setting it together with TrustedProxies is contradictory and is an error.
+	DirectlyExposed bool
 
 	// RateLimitStore supplies a shared store, such as the redisstore module, so
 	// that every instance enforces one limit rather than one each. When nil, a
@@ -147,6 +209,22 @@ type Config struct {
 	// RateLimitOptions are passed through to ratelimit.New. Options set here
 	// are applied after the ones this preset derives from Config, so they win.
 	RateLimitOptions []ratelimit.Option
+
+	// BodyLimitOptions are passed through to validate.MaxBodyBytes, for
+	// replacing the 413 written when a request declares a body larger than the
+	// limit.
+	//
+	// It exists so that adopting the preset does not cost you a hook you would
+	// have had by wiring the packages yourself. Without it, an application with
+	// its own error envelope gets that envelope from the rate limiter, the CSRF
+	// check and the store-outage path — every rejection in the chain — and
+	// text/plain from this one, which is the inconsistency the preset is
+	// supposed to save you from rather than introduce.
+	//
+	// Note that this covers only the declared-Content-Length rejection. The
+	// other half of the body limit surfaces inside your handler as a
+	// *http.MaxBytesError and is mapped there; see validate.MaxBodyBytes.
+	BodyLimitOptions []validate.BodyLimitOption
 }
 
 // Headers returns a chain containing only the response-header middleware.
@@ -205,6 +283,16 @@ func API(cfg Config) (middleware.Chain, error) {
 
 	if !cfg.DisableRateLimit {
 		opts := []ratelimit.Option{}
+		if len(cfg.TrustedProxies) > 0 {
+			// The whole point of the field: the library already knows how to do
+			// this correctly, and the preset should reach it rather than leave
+			// every consumer to wire realip by hand through RateLimitOptions.
+			extractor, err := realip.New(cfg.TrustedProxies)
+			if err != nil {
+				return middleware.Chain{}, fmt.Errorf("preset: TrustedProxies: %w", err)
+			}
+			opts = append(opts, ratelimit.WithKeyFunc(extractor.KeyFunc()))
+		}
 		if cfg.RateLimitStore != nil {
 			opts = append(opts, ratelimit.WithStore(cfg.RateLimitStore))
 		}
@@ -221,7 +309,7 @@ func API(cfg Config) (middleware.Chain, error) {
 	if maxBody == 0 {
 		maxBody = DefaultMaxBodyBytes
 	}
-	mw = append(mw, validate.MaxBodyBytes(maxBody))
+	mw = append(mw, validate.MaxBodyBytes(maxBody, cfg.BodyLimitOptions...))
 
 	if !cfg.DisableCSRF {
 		opts := []csrf.Option{}
@@ -243,10 +331,10 @@ func API(cfg Config) (middleware.Chain, error) {
 // validate reports the first configuration problem that would result in a
 // silently missing protection.
 func (cfg Config) validate() error {
-	if !cfg.DisableCSRF && len(cfg.CSRFSecret) == 0 {
+	if !cfg.DisableCSRF && cfg.CSRFSecret.IsZero() {
 		return ErrMissingCSRFSecret
 	}
-	if cfg.DisableCSRF && len(cfg.CSRFSecret) > 0 {
+	if cfg.DisableCSRF && !cfg.CSRFSecret.IsZero() {
 		// Contradictory input. Guessing which half was meant would mean either
 		// silently ignoring a secret that was deliberately supplied, or
 		// silently enabling a protection that was deliberately disabled.
@@ -257,6 +345,16 @@ func (cfg Config) validate() error {
 	}
 	if cfg.DisableRateLimit && (cfg.RateLimitBurst > 0 || cfg.RateLimitPerSec > 0) {
 		return errors.New("preset: rate limits are set but DisableRateLimit is also set; pick one")
+	}
+	if len(cfg.TrustedProxies) > 0 && cfg.DirectlyExposed {
+		// Contradictory input, same treatment as the pairs above: one says
+		// requests arrive through a proxy, the other says they do not.
+		return errors.New("preset: TrustedProxies is set but DirectlyExposed is also set; pick one")
+	}
+	if !cfg.DisableRateLimit && len(cfg.TrustedProxies) == 0 && !cfg.DirectlyExposed {
+		// The ambiguous case, and the only one that must be impossible: an
+		// empty TrustedProxies cannot be told apart from an unset one.
+		return ErrProxyTopologyUnspecified
 	}
 	return nil
 }

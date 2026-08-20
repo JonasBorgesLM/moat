@@ -420,23 +420,40 @@ func (g *Guard) wrap(name string, err error) error {
 //
 // The handler serves the path from r.URL.Path, so wrap it in http.StripPrefix
 // when it is mounted under a prefix.
-func (g *Guard) FileServer() http.Handler {
+//
+// # Customizing the two rejections
+//
+// The handler can reject a request in two places, and both are replaceable:
+// [WithNotFoundHandler] for the 404 and [WithMethodNotAllowedHandler] for the
+// 405. Replace both or neither. An application with its own error envelope that
+// overrides only one answers the same handler in two formats, which is the
+// inconsistency the option existed to remove.
+func (g *Guard) FileServer(opts ...Option) http.Handler {
+	cfg := fileServerConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			// Set before dispatching, so a custom handler inherits it and does
+			// not have to know that 405 requires Allow to be conformant.
 			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			cfg.writeMethodNotAllowed(w, r)
 			return
 		}
 
 		name, ok := urlPathToName(r.URL.Path)
 		if !ok {
-			notFound(w)
+			cfg.writeNotFound(w, r)
 			return
 		}
 
 		f, err := g.Open(name)
 		if err != nil {
-			notFound(w)
+			cfg.writeNotFound(w, r)
 			return
 		}
 		defer f.Close()
@@ -445,12 +462,80 @@ func (g *Guard) FileServer() http.Handler {
 		if err != nil || fi.IsDir() || !fi.Mode().IsRegular() {
 			// Directories are not listed, and a device or FIFO inside the root
 			// is not something an HTTP file server should be streaming.
-			notFound(w)
+			cfg.writeNotFound(w, r)
 			return
 		}
 
 		http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
 	})
+}
+
+// Option configures the handler returned by [Guard.FileServer].
+type Option func(*fileServerConfig)
+
+// fileServerConfig holds the replaceable responses for one FileServer.
+type fileServerConfig struct {
+	notFound         http.Handler
+	methodNotAllowed http.Handler
+}
+
+// WithNotFoundHandler replaces the response written for every rejection that is
+// not a method mismatch.
+//
+// The default writes 404 with an identical body for all of them. A replacement
+// must preserve that: it receives no indication of which check failed, and that
+// is deliberate. Reintroducing the distinction — 403 for permission denied, 404
+// for missing — rebuilds the filesystem-mapping oracle described above, and a
+// handler that echoes r.URL.Path back turns the response into a reflection
+// point. Write a constant body.
+//
+// A nil handler is ignored.
+func WithNotFoundHandler(h http.Handler) Option {
+	return func(c *fileServerConfig) {
+		if h != nil {
+			c.notFound = h
+		}
+	}
+}
+
+// WithMethodNotAllowedHandler replaces the response written when the method is
+// neither GET nor HEAD. The default writes 405.
+//
+// The Allow header is already set on the ResponseWriter when the handler runs,
+// so a replacement can write any body without having to remember that a 405
+// without Allow is not a conformant response. Do not delete it.
+//
+// It is deliberately distinct from the not-found handler: 405 is a protocol
+// answer that reveals nothing about the filesystem, whereas answering a bad
+// method with the 404 body would tell a client that the path does not exist,
+// which is a claim this handler otherwise refuses to make.
+//
+// A nil handler is ignored.
+func WithMethodNotAllowedHandler(h http.Handler) Option {
+	return func(c *fileServerConfig) {
+		if h != nil {
+			c.methodNotAllowed = h
+		}
+	}
+}
+
+// writeNotFound writes the single response used for every non-method
+// rejection, so that no caller can tell which check failed.
+func (c fileServerConfig) writeNotFound(w http.ResponseWriter, r *http.Request) {
+	if c.notFound != nil {
+		c.notFound.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "404 page not found", http.StatusNotFound)
+}
+
+// writeMethodNotAllowed writes the response for a method other than GET or HEAD.
+func (c fileServerConfig) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	if c.methodNotAllowed != nil {
+		c.methodNotAllowed.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
 // urlPathToName converts a URL path into a name relative to the root, rejecting
@@ -480,10 +565,4 @@ func urlPathToName(p string) (string, bool) {
 		}
 	}
 	return name, true
-}
-
-// notFound writes the single response used for every rejection, so that no
-// caller can tell which check failed.
-func notFound(w http.ResponseWriter) {
-	http.Error(w, "404 page not found", http.StatusNotFound)
 }

@@ -272,13 +272,18 @@ func TestRulesDoNotPanicOnHostileInput(t *testing.T) {
 // FuzzRules asserts no rule panics and that the accept/reject decision is
 // stable, for arbitrary input.
 func FuzzRules(f *testing.F) {
-	for _, seed := range []string{"", "ada@example.com", "<script>", "\xff", strings.Repeat("x", 300), "a@b.c"} {
+	for _, seed := range []string{
+		"", "ada@example.com", "<script>", "\xff", strings.Repeat("x", 300), "a@b.c",
+		"https://example.com", "javascript:alert(1)", "java\tscript:alert(1)",
+		"//evil.example.com", "data:text/html,x", "HTTPS://EXAMPLE.COM", "https:",
+	} {
 		f.Add(seed)
 	}
 	rules := []validate.Rule{
 		validate.Required(), validate.MinLen(3), validate.MaxLen(64),
 		validate.Email(), validate.OneOf("asc", "desc"), validate.NoHTMLTags(),
 		validate.Matches(regexp.MustCompile(`\A[a-z]+\z`), "lowercase only"),
+		validate.URL(),
 	}
 	f.Fuzz(func(t *testing.T, s string) {
 		for i, rule := range rules {
@@ -301,6 +306,29 @@ func FuzzRules(f *testing.F) {
 		// whatever encoding tricks the rest of the input uses.
 		if strings.ContainsAny(s, "<>") && validate.NoHTMLTags()("f", s) == nil {
 			t.Fatalf("NoHTMLTags accepted %q", s)
+		}
+
+		// URL must never accept a value a browser would treat as a
+		// script-bearing scheme. The browser strips these characters before
+		// parsing, so the comparison is made against the stripped form -- which
+		// is exactly the transformation an allow-list on the parsed scheme
+		// misses.
+		if validate.URL()("f", s) == nil {
+			stripped := strings.Map(func(r rune) rune {
+				if r == '\t' || r == '\n' || r == '\r' {
+					return -1
+				}
+				return r
+			}, s)
+			lower := strings.ToLower(stripped)
+			for _, bad := range []string{"javascript:", "data:", "vbscript:", "file:"} {
+				if strings.HasPrefix(lower, bad) {
+					t.Fatalf("URL accepted %q, which a browser reads as %q", s, bad)
+				}
+			}
+			if strings.HasPrefix(stripped, "//") {
+				t.Fatalf("URL accepted the scheme-relative value %q", s)
+			}
 		}
 	})
 }
@@ -341,4 +369,89 @@ func ExampleMatches() {
 	// Output:
 	// <nil>
 	// slug: must be a slug
+}
+
+func TestURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		schemes []string
+		value   string
+		wantOK  bool
+	}{
+		{name: "https is allowed", value: "https://example.com/path?q=1#f", wantOK: true},
+		{name: "http is allowed", value: "http://example.com", wantOK: true},
+		{name: "a port and credentials still parse", value: "https://u:p@example.com:8443/x", wantOK: true}, // #nosec G101 -- fixture URL; the userinfo is the shape under test, not a credential.
+		{name: "an IPv6 host parses", value: "https://[2001:db8::1]:8443/x", wantOK: true},
+		{name: "uppercase scheme is allowed", value: "HTTPS://example.com", wantOK: true},
+
+		// The two the rule exists for.
+		{name: "javascript is rejected", value: "javascript:alert(1)"},
+		{name: "javascript with mixed case is rejected", value: "JaVaScRiPt:alert(1)"},
+		{name: "data is rejected", value: "data:text/html,<script>alert(1)</script>"},
+		{name: "data base64 is rejected", value: "data:text/html;base64,PHNjcmlwdD4="},
+		{name: "vbscript is rejected", value: "vbscript:msgbox(1)"},
+		{name: "file is rejected", value: "file:///etc/passwd"},
+
+		// The control-character bypass: a browser strips these and navigates as
+		// javascript:, while net/url sees something else entirely.
+		{name: "tab inside the scheme is rejected", value: "java\tscript:alert(1)"},
+		{name: "newline inside the scheme is rejected", value: "java\nscript:alert(1)"},
+		{name: "carriage return inside the scheme is rejected", value: "java\rscript:alert(1)"},
+		{name: "NUL inside the scheme is rejected", value: "java\x00script:alert(1)"},
+		{name: "a leading space is rejected", value: " https://example.com"},
+		{name: "a leading newline is rejected", value: "\nhttps://example.com"},
+		{name: "DEL is rejected", value: "https://example.com/\x7f"},
+
+		// Open redirect shapes.
+		{name: "scheme-relative is rejected", value: "//evil.example.com/path"},
+		{name: "a backslash scheme-relative is rejected", value: "\\\\evil.example.com"},
+		{name: "a relative path is rejected", value: "/dashboard"},
+		{name: "a bare host is rejected", value: "example.com"},
+
+		{name: "empty is rejected", value: ""},
+		{name: "a hierarchical scheme with no host is rejected", value: "https:"},
+		{name: "an empty host is rejected", value: "http:///path"},
+
+		// Explicit allow-lists.
+		{name: "a custom scheme can be allowed", schemes: []string{"ftp"}, value: "ftp://files.example.com/x", wantOK: true},
+		{name: "the default is replaced, not extended", schemes: []string{"ftp"}, value: "https://example.com"},
+		{name: "an empty allow-list rejects everything", schemes: []string{""}, value: "https://example.com"},
+		{name: "the allow-list is matched case-insensitively", schemes: []string{"HTTPS"}, value: "https://example.com", wantOK: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := validate.URL(tc.schemes...)
+			err := rule("website", tc.value)
+			if tc.wantOK && err != nil {
+				t.Errorf("URL(%q) = %v, want nil", tc.value, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("URL(%q) = nil, want an error", tc.value)
+			}
+		})
+	}
+}
+
+// TestURLErrorDoesNotEchoTheValue: the rejected value is attacker-authored and
+// the error is shown to a user, so it must not become a reflection point.
+func TestURLErrorDoesNotEchoTheValue(t *testing.T) {
+	const payload = "javascript:alert(document.domain)"
+	err := validate.URL()("website", payload)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), payload) || strings.Contains(err.Error(), "alert") {
+		t.Errorf("the error echoed the payload: %v", err)
+	}
+}
+
+func ExampleURL() {
+	err := validate.Validate("website", "javascript:alert(1)",
+		validate.Required(),
+		validate.MaxLen(2048),
+		validate.URL(),
+	)
+	fmt.Println(err)
+	// Output: website: must be a valid URL
 }

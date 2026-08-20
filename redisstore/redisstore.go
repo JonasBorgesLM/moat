@@ -49,6 +49,44 @@
 // refilled bucket would hand its client a fresh allowance, which is a
 // rate-limit bypass rather than a cache miss.
 //
+// # Redis must be configured with maxmemory-policy noeviction
+//
+// That TTL reasoning is enforceable only as far as Redis lets it be. A server
+// running under maxmemory with any eviction policy discards keys to reclaim
+// memory whenever it is under pressure, and it does not know that these
+// particular keys are rate-limit state — so it will drop a bucket that has not
+// refilled, which is exactly the allowance grant the TTL floor exists to
+// prevent.
+//
+// Worse, it drops the wrong one. Recency is anti-correlated with safety here: a
+// client that has just exhausted its burst cannot make requests, so its bucket
+// stops being touched and becomes the *best* eviction candidate, while the
+// bucket that has actually refilled — free to drop — was touched recently and is
+// spared. The eviction lands on the one client whose limit it resets.
+//
+// noeviction is the only safe setting, and the volatile-* family is not the
+// narrower alternative it looks like. Every bucket carries a TTL, so "volatile"
+// excludes nothing here; in a Redis shared with a cache whose entries do not all
+// expire, it makes the rate-limit buckets the *preferred* victims. volatile-ttl
+// is not an escape either: bucket TTLs are all refreshed to the same value on
+// every call, so "nearest expiry" is "longest idle" restated — the same recency
+// ordering, with the same anti-correlation.
+//
+// Under noeviction, Redis rejects writes at the memory ceiling rather than
+// silently discarding limits. This store then returns an error and
+// ratelimit.WithFailureMode decides what happens, which is a visible outage
+// instead of an invisible bypass — the trade this library makes everywhere else
+// too. Give rate-limit state an instance or logical database that is not shared
+// with a general-purpose cache; memory stays bounded by the TTLs regardless,
+// since every bucket carries one.
+//
+// [New] checks this at construction where the server will answer, and returns
+// [ErrUnsafeEvictionPolicy] if it can see that eviction is on. The check is
+// best-effort — managed Redis usually disables CONFIG — so it closes the case of
+// an operator who never knew, without being something to rely on. This mirrors
+// the choice ratelimit.MemoryStore makes in-process, where the same reasoning
+// ruled out an LRU cap.
+//
 // # Threat model notes
 //
 //   - Redis is trusted infrastructure here. Anyone who can write to it can set
@@ -69,6 +107,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/JonasBorgesLM/moat/ratelimit"
@@ -107,6 +147,46 @@ const (
 // is deliberately an error rather than a best-effort interpretation.
 var ErrUnexpectedReply = errors.New("redisstore: unexpected reply from token bucket script")
 
+// ErrUnsafeEvictionPolicy reports that the Redis server is configured to evict
+// keys under memory pressure, which silently defeats this store's limit.
+//
+// # Why this is not merely a tuning preference
+//
+// Every bucket carries a TTL chosen so that a bucket is never dropped before it
+// would have refilled completely — dropping a partially refilled bucket hands
+// its client a fresh allowance, which is a bypass rather than a cache miss. A
+// server running under maxmemory with an eviction policy discards keys whenever
+// it is short of memory, and it has no idea these particular keys are
+// rate-limit state. The TTL reasoning is then decorative.
+//
+// Worse, the policies evict in the wrong order. Redis evicts by approximate
+// idle time (the lru policies) or by nearest expiry (volatile-ttl); because
+// every bucket's TTL is refreshed to the same value on every call, nearest
+// expiry is idle time restated, so both come to the same ordering. And idle time
+// is anti-correlated with safety here: a client that has just exhausted its
+// burst cannot make requests, so its bucket stops being touched and becomes the
+// most attractive eviction candidate — while the bucket that has actually
+// refilled, and could be dropped for free, was touched recently and is spared.
+// The eviction therefore lands on the one client whose limit it resets. This is
+// the same failure ratelimit.MemoryStore fixed in-process by ordering on refill
+// level instead of recency; here the ordering belongs to Redis and cannot be
+// changed from Go.
+//
+// # Only noeviction is safe
+//
+// Every volatile-* policy targets keys that have a TTL, and every bucket has
+// one, so "volatile" is not a narrower blast radius — in a Redis shared with a
+// cache whose entries do not all expire, it makes the rate-limit buckets the
+// *preferred* victims. volatile-ttl is not an escape either, for the reason
+// above. That leaves noeviction, under which Redis rejects writes at the
+// memory ceiling instead of silently discarding limits; the store then returns
+// an error and ratelimit.WithFailureMode decides, which is a visible outage
+// rather than an invisible bypass.
+//
+// If eviction is genuinely acceptable for your deployment, say so with
+// [InsecureAllowKeyEviction].
+var ErrUnsafeEvictionPolicy = errors.New("redisstore: Redis is configured to evict keys under memory pressure, which silently resets rate limits; set maxmemory-policy to noeviction, or pass redisstore.InsecureAllowKeyEviction if that is genuinely intended")
+
 // Store is a Redis-backed [ratelimit.Store].
 //
 // It is safe for concurrent use. Create it with [New]; the zero value is not
@@ -116,6 +196,10 @@ type Store struct {
 	keyPrefix string
 	idleTTL   time.Duration
 	timeout   time.Duration
+
+	// allowEviction records an explicit [InsecureAllowKeyEviction]. It is read
+	// during construction only; nothing on the request path consults it.
+	allowEviction bool
 }
 
 // Option configures a [Store].
@@ -148,7 +232,141 @@ func New(client redis.Scripter, opts ...Option) (*Store, error) {
 			opt(s)
 		}
 	}
+	if err := s.checkEvictionPolicy(); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// checkEvictionPolicy asks the server whether it is configured to evict keys,
+// and refuses to build a Store if it positively determines that it is.
+//
+// # Best effort, and deliberately so
+//
+// The check is skipped, silently, whenever the answer cannot be established:
+// the client type exposes no CONFIG command, CONFIG is disabled or renamed (the
+// normal case on managed Redis — ElastiCache, MemoryDB, Upstash and Azure Cache
+// all restrict it), the server is not reachable yet, or the reply is not
+// understood. Only a definite "yes, this server evicts" produces an error.
+//
+// That asymmetry is the point. A library that guesses would either reject
+// working deployments it cannot inspect, or claim an assurance it does not have.
+// Refusing only what it can actually see keeps the error trustworthy: if it
+// fires, it is right.
+//
+// # What a passing check does and does not mean
+//
+// It means this server reported a safe configuration at the moment the Store was
+// built. It is a snapshot of another system's mutable runtime state, not an
+// invariant: `CONFIG SET maxmemory-policy allkeys-lru` is one command away, and
+// the moment it is most likely to be run is a memory incident — exactly when the
+// bypass matters. A cluster node that joins later is not covered either. So this
+// closes the case of an operator who never knew; it does not make the deployment
+// permanently safe, and the documentation on [ErrUnsafeEvictionPolicy] is still
+// the thing an operator has to have read.
+//
+// It costs one round trip at construction, bounded by the store's timeout. New
+// still does not fail because Redis is down — an unreachable server is a case
+// the check cannot establish, so it is skipped.
+func (s *Store) checkEvictionPolicy() error {
+	if s.allowEviction {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	// A cluster or a ring answers per node, and a single node's configuration
+	// says nothing about its peers, so every reachable one is asked.
+	switch c := s.client.(type) {
+	case interface {
+		ForEachMaster(context.Context, func(context.Context, *redis.Client) error) error
+	}:
+		var unsafe error
+		// A per-node transport failure must not abort the sweep, so the closure
+		// only ever returns nil and the verdict is carried out separately.
+		_ = c.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			if err := evictionPolicyOf(ctx, node); err != nil && unsafe == nil {
+				unsafe = err
+			}
+			return nil
+		})
+		return unsafe
+	case interface {
+		ForEachShard(context.Context, func(context.Context, *redis.Client) error) error
+	}:
+		var unsafe error
+		_ = c.ForEachShard(ctx, func(ctx context.Context, node *redis.Client) error {
+			if err := evictionPolicyOf(ctx, node); err != nil && unsafe == nil {
+				unsafe = err
+			}
+			return nil
+		})
+		return unsafe
+	case configReader:
+		return evictionPolicyOf(ctx, c)
+	}
+	return nil
+}
+
+// configReader is the sliver of a go-redis client needed to read server
+// configuration. It is matched by type assertion rather than required by [New],
+// so that a client which cannot answer — including a test double — is skipped
+// instead of rejected.
+type configReader interface {
+	ConfigGet(ctx context.Context, parameter string) *redis.MapStringStringCmd
+}
+
+// evictionPolicyOf returns [ErrUnsafeEvictionPolicy] when one server is known to
+// evict, and nil in every case where that cannot be established.
+func evictionPolicyOf(ctx context.Context, c configReader) error {
+	// One glob rather than two parameters: CONFIG GET took a single parameter
+	// until Redis 7, and both values are needed together anyway.
+	cfg, err := c.ConfigGet(ctx, "maxmemory*").Result()
+	if err != nil {
+		return nil // CONFIG is unavailable; the library genuinely cannot know.
+	}
+
+	// Without a memory ceiling Redis never evicts, whatever the policy says, so
+	// a non-default policy on an uncapped server is not a finding.
+	limit, ok := cfg["maxmemory"]
+	if !ok {
+		return nil
+	}
+	if bytes, convErr := strconv.ParseInt(strings.TrimSpace(limit), 10, 64); convErr != nil || bytes == 0 {
+		return nil
+	}
+
+	policy, ok := cfg["maxmemory-policy"]
+	if !ok {
+		return nil
+	}
+	// Compared case-folded, but reported verbatim: an operator matching the
+	// error against their own config file wants the string the server gave.
+	if normalized := strings.ToLower(strings.TrimSpace(policy)); normalized == "" || normalized == "noeviction" {
+		return nil
+	}
+	return fmt.Errorf("%w (server reports maxmemory-policy %q with maxmemory set)", ErrUnsafeEvictionPolicy, policy)
+}
+
+// InsecureAllowKeyEviction lets [New] build a Store against a Redis server that
+// is configured to evict keys under memory pressure.
+//
+// Read the name literally. It does not relax a check; it accepts that the server
+// may discard rate-limit state at any moment, and that each discarded bucket
+// hands its client a fresh full burst — landing, for the reasons in
+// [ErrUnsafeEvictionPolicy], on whichever client has most recently been
+// throttled. The limit becomes advisory under memory pressure.
+//
+// It exists because the refusal would otherwise be a lie about deployments where
+// eviction is a considered trade: a shared cache instance where an approximate
+// limit is worth more than an outage at the memory ceiling, or a staging
+// environment where nobody cares. It also skips the round trip, which suits a
+// process that builds its store before Redis is reachable.
+//
+// It is deliberately not spelled With..., and deliberately not a bool field. It
+// should be impossible to read a call site containing it and not notice.
+func InsecureAllowKeyEviction() Option {
+	return func(s *Store) { s.allowEviction = true }
 }
 
 // WithKeyPrefix sets the namespace for bucket keys. The default is
@@ -197,7 +415,13 @@ func WithTimeout(d time.Duration) Option {
 //
 // Any transport or protocol failure is returned. Nothing here converts a
 // failure into an allow.
-func (s *Store) Take(ctx context.Context, key string, cfg ratelimit.Config, now time.Time) (ratelimit.Result, error) {
+func (s *Store) TakeN(ctx context.Context, key string, n int, cfg ratelimit.Config, now time.Time) (ratelimit.Result, error) {
+	if n < 1 {
+		// Clamped here as well as in the script: a store is required to do it
+		// by the ratelimit.Store contract, and it must hold even if the script
+		// is ever replaced.
+		n = 1
+	}
 	burst := cfg.Burst
 	if burst < 1 {
 		burst = 1
@@ -218,6 +442,7 @@ func (s *Store) Take(ctx context.Context, key string, cfg ratelimit.Config, now 
 		rate,
 		now.UnixMilli(),
 		s.ttlMillis(burst, rate),
+		n,
 	}
 
 	raw, err := tokenBucket.Run(ctx, s.client, []string{s.keyPrefix + key}, args...).Result()

@@ -14,18 +14,21 @@ import (
 	"github.com/JonasBorgesLM/moat/csrf"
 	"github.com/JonasBorgesLM/moat/preset"
 	"github.com/JonasBorgesLM/moat/ratelimit"
+	"github.com/JonasBorgesLM/moat/realip"
+	"github.com/JonasBorgesLM/moat/secret"
 	"github.com/JonasBorgesLM/moat/secureheaders"
+	"github.com/JonasBorgesLM/moat/validate"
 )
 
 const host = "app.example.com"
 
-func secret(t *testing.T) []byte {
+func testSecret(t *testing.T) secret.Value {
 	t.Helper()
-	s, err := csrf.GenerateSecret()
+	v, err := csrf.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s
+	return v
 }
 
 func okHandler() http.Handler {
@@ -36,7 +39,7 @@ func okHandler() http.Handler {
 
 // TestAPIRefusesToOmitAProtection is the reason API returns an error at all.
 func TestAPIRefusesToOmitAProtection(t *testing.T) {
-	valid := secret(t)
+	valid := testSecret(t)
 
 	tests := []struct {
 		name    string
@@ -70,7 +73,7 @@ func TestAPIRefusesToOmitAProtection(t *testing.T) {
 		},
 		{
 			name:    "a short CSRF secret is refused",
-			cfg:     preset.Config{CSRFSecret: []byte("too-short"), RateLimitBurst: 10, RateLimitPerSec: 5},
+			cfg:     preset.Config{CSRFSecret: secret.New([]byte("too-short")), RateLimitBurst: 10, RateLimitPerSec: 5, DirectlyExposed: true},
 			wantErr: csrf.ErrSecretTooShort,
 		},
 	}
@@ -100,11 +103,11 @@ func TestAPIAcceptsDeliberateOmissions(t *testing.T) {
 	}{
 		{
 			name: "CSRF disabled explicitly",
-			cfg:  preset.Config{DisableCSRF: true, RateLimitBurst: 10, RateLimitPerSec: 5},
+			cfg:  preset.Config{DisableCSRF: true, RateLimitBurst: 10, RateLimitPerSec: 5, DirectlyExposed: true},
 		},
 		{
 			name: "rate limiting disabled explicitly",
-			cfg:  preset.Config{CSRFSecret: secret(t), DisableRateLimit: true},
+			cfg:  preset.Config{CSRFSecret: testSecret(t), DisableRateLimit: true},
 		},
 		{
 			name: "both disabled explicitly",
@@ -141,11 +144,11 @@ func TestAPIRejectsContradictoryConfig(t *testing.T) {
 	}{
 		{
 			name: "a secret alongside DisableCSRF",
-			cfg:  preset.Config{CSRFSecret: secret(t), DisableCSRF: true, RateLimitBurst: 10, RateLimitPerSec: 5},
+			cfg:  preset.Config{CSRFSecret: testSecret(t), DisableCSRF: true, RateLimitBurst: 10, RateLimitPerSec: 5},
 		},
 		{
 			name: "limits alongside DisableRateLimit",
-			cfg:  preset.Config{CSRFSecret: secret(t), DisableRateLimit: true, RateLimitBurst: 10, RateLimitPerSec: 5},
+			cfg:  preset.Config{CSRFSecret: testSecret(t), DisableRateLimit: true, RateLimitBurst: 10, RateLimitPerSec: 5},
 		},
 	}
 	for _, tc := range tests {
@@ -161,12 +164,13 @@ func TestAPIRejectsContradictoryConfig(t *testing.T) {
 // time: for each pair, a request that trips both must be answered by the
 // earlier one.
 func TestMiddlewareOrder(t *testing.T) {
-	sec := secret(t)
+	sec := testSecret(t)
 
 	// Burst of 1 so the second request is over the limit.
 	newChain := func(t *testing.T) http.Handler {
 		t.Helper()
 		chain, err := preset.API(preset.Config{
+			DirectlyExposed: true,
 			CSRFSecret:      sec,
 			RateLimitBurst:  1,
 			RateLimitPerSec: 1,
@@ -258,7 +262,8 @@ func TestMiddlewareOrder(t *testing.T) {
 // TestEndToEnd walks the flow a browser actually performs.
 func TestEndToEnd(t *testing.T) {
 	chain, err := preset.API(preset.Config{
-		CSRFSecret:      secret(t),
+		DirectlyExposed: true,
+		CSRFSecret:      testSecret(t),
 		RateLimitBurst:  20,
 		RateLimitPerSec: 10,
 	})
@@ -312,8 +317,20 @@ func TestEndToEnd(t *testing.T) {
 	if rec := post(issued); rec.Code != http.StatusOK {
 		t.Errorf("POST with a valid token: status = %d, want 200 (body %q)", rec.Code, rec.Body)
 	}
-	// 3. POST with a stale token fails.
-	if rec := post(issued[:len(issued)-1] + "Z"); rec.Code != http.StatusForbidden {
+	// 3. POST with a tampered token fails.
+	//
+	// The mutation is on the *first* character deliberately. Changing the last
+	// one used to look equivalent and was not: the final base64 character of a
+	// token carries four significant bits and two unused ones, so replacing it
+	// left the decoded token unchanged about a quarter of the time and this
+	// assertion passed without anything having been tampered with. It made the
+	// test flaky at roughly 20%, and it would have gone on "passing" against a
+	// library that accepted tampered tokens outright.
+	tampered := "A" + issued[1:]
+	if issued[0] == 'A' {
+		tampered = "B" + issued[1:]
+	}
+	if rec := post(tampered); rec.Code != http.StatusForbidden {
 		t.Errorf("POST with a tampered token: status = %d, want 403", rec.Code)
 	}
 	// 4. POST with no token fails.
@@ -337,7 +354,8 @@ func TestMaxBodyBytes(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			chain, err := preset.API(preset.Config{
-				CSRFSecret:      secret(t),
+				DirectlyExposed: true,
+				CSRFSecret:      testSecret(t),
 				RateLimitBurst:  10,
 				RateLimitPerSec: 10,
 				MaxBodyBytes:    tc.limit,
@@ -363,7 +381,8 @@ func TestMaxBodyBytes(t *testing.T) {
 // component, so that adopting the preset does not mean giving up tuning.
 func TestOptionsArePassedThrough(t *testing.T) {
 	chain, err := preset.API(preset.Config{
-		CSRFSecret:      secret(t),
+		DirectlyExposed: true,
+		CSRFSecret:      testSecret(t),
 		RateLimitBurst:  10,
 		RateLimitPerSec: 10,
 		HeaderOptions: []secureheaders.Option{
@@ -423,7 +442,8 @@ func TestOptionsArePassedThrough(t *testing.T) {
 // TestTrustedOrigins checks the Config field reaches the CSRF Origin check.
 func TestTrustedOrigins(t *testing.T) {
 	chain, err := preset.API(preset.Config{
-		CSRFSecret:      secret(t),
+		DirectlyExposed: true,
+		CSRFSecret:      testSecret(t),
 		RateLimitBurst:  10,
 		RateLimitPerSec: 10,
 		TrustedOrigins:  []string{"https://console.example.com"},
@@ -471,7 +491,8 @@ func TestOnErrorReceivesStoreFailures(t *testing.T) {
 	var reported error
 
 	chain, err := preset.API(preset.Config{
-		CSRFSecret:      secret(t),
+		DirectlyExposed: true,
+		CSRFSecret:      testSecret(t),
 		RateLimitBurst:  10,
 		RateLimitPerSec: 10,
 		RateLimitStore:  failingStore{err: outage},
@@ -496,7 +517,7 @@ func TestOnErrorReceivesStoreFailures(t *testing.T) {
 
 type failingStore struct{ err error }
 
-func (s failingStore) Take(context.Context, string, ratelimit.Config, time.Time) (ratelimit.Result, error) {
+func (s failingStore) TakeN(context.Context, string, int, ratelimit.Config, time.Time) (ratelimit.Result, error) {
 	return ratelimit.Result{}, s.err
 }
 func (s failingStore) Close() error { return nil }
@@ -509,6 +530,7 @@ func TestSharedStoreIsUsed(t *testing.T) {
 
 	newChain := func() http.Handler {
 		chain, err := preset.API(preset.Config{
+			DirectlyExposed: true,
 			DisableCSRF:     true,
 			RateLimitBurst:  1,
 			RateLimitPerSec: 0.001,
@@ -545,10 +567,11 @@ func TestSharedStoreIsUsed(t *testing.T) {
 
 func ExampleAPI() {
 	// In production, load this from your secret store.
-	secret := []byte("a-32-byte-or-longer-secret-value")
+	key := secret.New([]byte("a-32-byte-or-longer-secret-value"))
 
 	chain, err := preset.API(preset.Config{
-		CSRFSecret:      secret,
+		DirectlyExposed: true,
+		CSRFSecret:      key,
 		RateLimitBurst:  20,
 		RateLimitPerSec: 5,
 	})
@@ -577,6 +600,7 @@ func ExampleAPI() {
 // shipping without CSRF protection.
 func ExampleAPI_missingSecret() {
 	_, err := preset.API(preset.Config{
+		DirectlyExposed: true,
 		RateLimitBurst:  20,
 		RateLimitPerSec: 5,
 	})
@@ -589,6 +613,7 @@ func ExampleAPI_missingSecret() {
 // attach one, so an API authenticated only that way is not exposed to CSRF.
 func ExampleAPI_bearerTokenAPI() {
 	chain, err := preset.API(preset.Config{
+		DirectlyExposed: true,
 		DisableCSRF:     true, // deliberate, greppable, reviewable
 		RateLimitBurst:  100,
 		RateLimitPerSec: 50,
@@ -606,4 +631,247 @@ func ExampleHeaders() {
 
 	fmt.Println(rec.Header().Get("Content-Security-Policy"))
 	// Output: default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'
+}
+
+// TestEveryRejectionHookIsReachableThroughThePreset is the coherence guard for
+// the §3.4 invariant at the preset layer.
+//
+// The invariant says every middleware that can reject a request exposes a
+// customizable handler. A preset that wires those middlewares but offers no way
+// to reach their hooks satisfies the letter and defeats the purpose: the point
+// of one-call adoption is that it does not cost you what selective adoption
+// would have given you.
+//
+// Every rejection the chain can produce must therefore carry the caller's
+// envelope. This test drives all four to a rejection and requires it.
+func TestEveryRejectionHookIsReachableThroughThePreset(t *testing.T) {
+	envelope := func(status int, msg string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			fmt.Fprintf(w, `{"error":%q}`, msg)
+		})
+	}
+
+	chain, err := preset.API(preset.Config{
+		DirectlyExposed: true,
+		CSRFSecret:      testSecret(t),
+		RateLimitBurst:  2,     // spent by the body-limit and CSRF probes below
+		RateLimitPerSec: 0.001, // effectively no refill for the life of the test
+		MaxBodyBytes:    8,
+		CSRFOptions: []csrf.Option{
+			csrf.WithErrorHandler(envelope(http.StatusForbidden, "csrf")),
+		},
+		RateLimitOptions: []ratelimit.Option{
+			ratelimit.WithDeniedHandler(envelope(http.StatusTooManyRequests, "rate")),
+		},
+		BodyLimitOptions: []validate.BodyLimitOption{
+			validate.WithMaxBodyErrorHandler(envelope(http.StatusRequestEntityTooLarge, "body")),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := chain.Then(okHandler())
+
+	// 1. Body too large. Ordered before CSRF in the chain, so this is what a
+	//    big unauthenticated POST hits first.
+	big := httptest.NewRequest(http.MethodPost, "https://"+host+"/x", strings.NewReader(strings.Repeat("A", 100)))
+	big.Host = host
+	big.Header.Set("Origin", "https://"+host)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, big)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("body limit: status = %d, want 413", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"body"`) {
+		t.Errorf("body limit answered %q, not the caller's envelope; "+
+			"BodyLimitOptions is not reaching validate.MaxBodyBytes", rec.Body)
+	}
+
+	// 2. CSRF rejection: a small POST with no token.
+	small := httptest.NewRequest(http.MethodPost, "https://"+host+"/x", strings.NewReader("hi"))
+	small.Host = host
+	small.Header.Set("Origin", "https://"+host)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, small)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("csrf: status = %d, want 403", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"csrf"`) {
+		t.Errorf("csrf answered %q, not the caller's envelope", rec.Body)
+	}
+
+	// 3. Rate limit: the burst of 2 was spent by the two requests above.
+	get := httptest.NewRequest(http.MethodGet, "https://"+host+"/x", nil)
+	get.Host = host
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, get)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate limit: status = %d, want 429", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"rate"`) {
+		t.Errorf("rate limit answered %q, not the caller's envelope", rec.Body)
+	}
+}
+
+// TestStoreErrorHookIsReachableThroughThePreset covers the fourth rejection,
+// which needs a failing store to provoke.
+func TestStoreErrorHookIsReachableThroughThePreset(t *testing.T) {
+	envelope := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"store"}`))
+	})
+
+	chain, err := preset.API(preset.Config{
+		DirectlyExposed: true,
+		CSRFSecret:      testSecret(t),
+		RateLimitBurst:  10,
+		RateLimitPerSec: 5,
+		RateLimitStore:  failingStore{err: errors.New("redis down")},
+		RateLimitOptions: []ratelimit.Option{
+			ratelimit.WithStoreErrorHandler(envelope),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "https://"+host+"/x", nil)
+	r.Host = host
+	chain.Then(okHandler()).ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"store"`) {
+		t.Errorf("store outage answered %q, not the caller's envelope", rec.Body)
+	}
+}
+
+// TestTrustedProxiesKeepsClientsInSeparateBuckets is the R4 HIGH-1 regression.
+//
+// Behind a load balancer every request carries the balancer's address in
+// RemoteAddr, so a limiter keyed on RemoteAddr counts every client on earth as
+// one client. The consequence is not a bypass — it is denial of service against
+// everyone else: one client spending its allowance holds the whole service at
+// the limit, and from outside it is indistinguishable from ordinary throttling.
+//
+// NEGATIVE CONTROL: delete the WithKeyFunc wiring in API (the `if
+// len(cfg.TrustedProxies) > 0` block), which is exactly the pre-fix behaviour,
+// and the victim below is refused. Verified red.
+func TestTrustedProxiesKeepsClientsInSeparateBuckets(t *testing.T) {
+	const burst = 5
+	chain, err := preset.API(preset.Config{
+		CSRFSecret:      testSecret(t),
+		RateLimitBurst:  burst,
+		RateLimitPerSec: 0.01, // nothing refills during the test
+		TrustedProxies:  []string{"10.0.0.0/8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := chain.Then(okHandler())
+
+	get := func(clientIP string) int {
+		r := httptest.NewRequest(http.MethodGet, "https://"+host+"/", nil)
+		r.Host = host
+		r.RemoteAddr = "10.0.0.7:54321" // the balancer, identical for every client
+		r.Header.Set("X-Forwarded-For", clientIP)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+
+	// One client spends its whole allowance.
+	for i := range burst {
+		if code := get("203.0.113.9"); code != http.StatusOK {
+			t.Fatalf("noisy client request %d: status = %d, want 200", i+1, code)
+		}
+	}
+	if code := get("203.0.113.9"); code != http.StatusTooManyRequests {
+		t.Errorf("noisy client past its burst: status = %d, want 429", code)
+	}
+
+	// A different client, arriving for the first time, must be unaffected.
+	for i := range burst {
+		if code := get("198.51.100.42"); code != http.StatusOK {
+			t.Fatalf("second client request %d: status = %d, want 200 — clients are sharing a bucket", i+1, code)
+		}
+	}
+}
+
+// TestProxyTopologyMustBeStated pins the shape of the requirement: the ambiguous
+// configuration is impossible, while both explicit answers work.
+//
+// An empty TrustedProxies is not rejected on its own, deliberately. Empty cannot
+// be told apart from "I have no proxy", and erroring on it would break the
+// legitimate direct deployment — which pushes an operator to type any CIDR at
+// all just to boot, a worse outcome than the one being fixed. So the choice is
+// forced instead: name the proxies, or state the exposure.
+func TestProxyTopologyMustBeStated(t *testing.T) {
+	base := func() preset.Config {
+		return preset.Config{
+			CSRFSecret:      testSecret(t),
+			RateLimitBurst:  10,
+			RateLimitPerSec: 5,
+		}
+	}
+
+	t.Run("neither answer is refused", func(t *testing.T) {
+		_, err := preset.API(base())
+		if !errors.Is(err, preset.ErrProxyTopologyUnspecified) {
+			t.Fatalf("error = %v, want ErrProxyTopologyUnspecified", err)
+		}
+	})
+
+	t.Run("TrustedProxies is accepted", func(t *testing.T) {
+		cfg := base()
+		cfg.TrustedProxies = []string{"10.0.0.0/8"}
+		if _, err := preset.API(cfg); err != nil {
+			t.Fatalf("API = %v, want no error", err)
+		}
+	})
+
+	t.Run("DirectlyExposed is accepted", func(t *testing.T) {
+		cfg := base()
+		cfg.DirectlyExposed = true
+		if _, err := preset.API(cfg); err != nil {
+			t.Fatalf("API = %v, want no error", err)
+		}
+	})
+
+	t.Run("both together is contradictory", func(t *testing.T) {
+		cfg := base()
+		cfg.TrustedProxies = []string{"10.0.0.0/8"}
+		cfg.DirectlyExposed = true
+		if _, err := preset.API(cfg); err == nil {
+			t.Fatal("API accepted TrustedProxies together with DirectlyExposed")
+		}
+	})
+
+	t.Run("not asked when rate limiting is off", func(t *testing.T) {
+		cfg := preset.Config{CSRFSecret: testSecret(t), DisableRateLimit: true}
+		if _, err := preset.API(cfg); err != nil {
+			t.Fatalf("API = %v, want no error", err)
+		}
+	})
+
+	t.Run("a bad CIDR is reported, not ignored", func(t *testing.T) {
+		cfg := base()
+		cfg.TrustedProxies = []string{"not-a-cidr"}
+		if _, err := preset.API(cfg); err == nil {
+			t.Fatal("API accepted an unparsable CIDR")
+		}
+	})
+
+	t.Run("the default route is refused through the preset too", func(t *testing.T) {
+		cfg := base()
+		cfg.TrustedProxies = []string{"0.0.0.0/0"}
+		if _, err := preset.API(cfg); !errors.Is(err, realip.ErrDefaultRouteTrusted) {
+			t.Fatalf("error = %v, want realip.ErrDefaultRouteTrusted", err)
+		}
+	})
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/JonasBorgesLM/moat/csrf"
 	"github.com/JonasBorgesLM/moat/middleware"
 	"github.com/JonasBorgesLM/moat/preset"
+	"github.com/JonasBorgesLM/moat/secret"
 )
 
 // Adapt converts a standard func(http.Handler) http.Handler into a
@@ -66,12 +67,12 @@ func AdaptChain(chain middleware.Chain) gin.HandlerFunc {
 }
 
 func main() {
-	secret, err := csrf.GenerateSecret()
+	key, err := csrf.GenerateSecret()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	router, err := newRouter(secret)
+	router, err := newRouter(key)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -89,9 +90,10 @@ func main() {
 }
 
 // newRouter is separate from main so the smoke test can drive it.
-func newRouter(secret []byte) (*gin.Engine, error) {
+func newRouter(key secret.Value) (*gin.Engine, error) {
 	chain, err := preset.API(preset.Config{
-		CSRFSecret:      secret,
+		DirectlyExposed: true,
+		CSRFSecret:      key,
 		RateLimitBurst:  20,
 		RateLimitPerSec: 5,
 	})

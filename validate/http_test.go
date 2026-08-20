@@ -1,6 +1,7 @@
 package validate_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -293,7 +294,7 @@ func TestRequireContentType(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			reached := false
-			h := validate.RequireContentType(tc.allowed...)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := validate.RequireContentType(tc.allowed)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				reached = true
 				w.WriteHeader(http.StatusOK)
 			}))
@@ -318,7 +319,7 @@ func TestRequireContentType(t *testing.T) {
 // TestRequireContentTypeChecksEmptyBodies pins the documented decision that a
 // POST must declare its type even when it happens to carry nothing.
 func TestRequireContentTypeChecksEmptyBodies(t *testing.T) {
-	h := validate.RequireContentType("application/json")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	h := validate.RequireContentType([]string{"application/json"})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	rec := httptest.NewRecorder()
@@ -364,30 +365,69 @@ func TestGuardOrdering(t *testing.T) {
 	}
 }
 
+// ExampleMaxBodyBytes wires both rejection paths to one error envelope.
+//
+// An oversized request is refused in two different places — by the middleware
+// when the declared Content-Length is too large, and by http.MaxBytesReader
+// inside the handler when the client lied or declared nothing. Adopting the
+// middleware means handling both, or the same condition produces two different
+// response shapes depending only on how the client framed its request.
 func ExampleMaxBodyBytes() {
-	// Handlers behind this must still check the error from reading the body:
-	// the limit is enforced during the read, and ignoring the error is the bug
-	// the middleware cannot prevent for you.
-	handler := validate.MaxBodyBytes(1 << 20)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The envelope the rest of the application already documents.
+	writeError := func(w http.ResponseWriter, status int, msg string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	}
+
+	const tooLarge = "request body too large"
+
+	// Path 1: the declared length is over the limit. The middleware answers,
+	// so the envelope is installed as an Option.
+	overLimit := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
+	})
+
+	// Path 2: the declaration was absent or a lie. Nothing is known until the
+	// body is read, the middleware has already returned, and the failure
+	// arrives as a *http.MaxBytesError from Read. Same envelope, by hand.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
+			writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "cannot read body")
 			return
 		}
 		fmt.Fprintf(w, "read %d bytes", len(body))
-	}))
+	})
 
-	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello"))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, r)
+	limited := validate.MaxBodyBytes(8, validate.WithMaxBodyErrorHandler(overLimit))(handler)
 
-	fmt.Println(rec.Code, rec.Body)
-	// Output: 200 read 5 bytes
+	// An honest oversized request: caught by the header check.
+	declared := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat("A", 100)))
+	honest := httptest.NewRecorder()
+	limited.ServeHTTP(honest, declared)
+
+	// The same body, declaring no length: caught by the reader instead.
+	chunked := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat("A", 100)))
+	chunked.ContentLength = -1
+	lying := httptest.NewRecorder()
+	limited.ServeHTTP(lying, chunked)
+
+	fmt.Printf("declared: %d %s", honest.Code, honest.Body)
+	fmt.Printf("chunked:  %d %s", lying.Code, lying.Body)
+
+	// Output:
+	// declared: 413 {"error":"request body too large"}
+	// chunked:  413 {"error":"request body too large"}
 }
 
 func ExampleRequireContentType() {
-	handler := validate.RequireContentType("application/json")(
+	handler := validate.RequireContentType([]string{"application/json"})(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -401,4 +441,134 @@ func ExampleRequireContentType() {
 
 	fmt.Println(rec.Code)
 	// Output: 415
+}
+
+// envelopeHandler writes the {"error": ...} shape an application with its own
+// contract would use, so a test can tell it apart from net/http's text/plain.
+func envelopeHandler(status int, msg string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	})
+}
+
+func TestWithMaxBodyErrorHandler(t *testing.T) {
+	custom := envelopeHandler(http.StatusRequestEntityTooLarge, "too big")
+	h := validate.MaxBodyBytes(5, validate.WithMaxBodyErrorHandler(custom))(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Error("the handler ran for an oversized request")
+		}))
+
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello world"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"too big"`) {
+		t.Errorf("body = %q, want the custom envelope", rec.Body)
+	}
+}
+
+// TestWithMaxBodyErrorHandlerDoesNotCoverTheReaderPath pins the documented
+// limit of the option: the second rejection path is not routed through it, and
+// an adopter who sets only the option still gets text/plain from the reader.
+// This is the asymmetry the doc comment tells them to close with errors.As.
+func TestWithMaxBodyErrorHandlerDoesNotCoverTheReaderPath(t *testing.T) {
+	custom := envelopeHandler(http.StatusRequestEntityTooLarge, "too big")
+	h := validate.MaxBodyBytes(5, validate.WithMaxBodyErrorHandler(custom))(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A handler that ignores the read error, as the docs warn against.
+			_, err := io.ReadAll(r.Body)
+			var maxErr *http.MaxBytesError
+			if !errors.As(err, &maxErr) {
+				t.Errorf("read error = %v, want *http.MaxBytesError", err)
+			}
+		}))
+
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello world"))
+	r.ContentLength = -1 // skip the header check, force the reader
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	if ct := rec.Header().Get("Content-Type"); ct == "application/json" {
+		t.Error("the option unexpectedly covered the reader path; update the docs")
+	}
+}
+
+// TestMaxBodyBytesWrapsTheReaderEvenWhenTheDeclaredLengthPasses is the
+// regression guard for the bypass: a small declared length must not stop the
+// reader from being installed, or a lying client gets through unbounded.
+func TestMaxBodyBytesWrapsTheReaderEvenWhenTheDeclaredLengthPasses(t *testing.T) {
+	var read int64
+	var readErr error
+	h := validate.MaxBodyBytes(5)(readAllHandler(&read, &readErr))
+
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat("A", 5000)))
+	r.ContentLength = 1 // a claim, and a false one
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	var maxErr *http.MaxBytesError
+	if !errors.As(readErr, &maxErr) {
+		t.Fatalf("read error = %v, want *http.MaxBytesError", readErr)
+	}
+	if read != 5 {
+		t.Errorf("handler read %d bytes, want 5", read)
+	}
+}
+
+func TestWithContentTypeErrorHandler(t *testing.T) {
+	custom := envelopeHandler(http.StatusUnsupportedMediaType, "unsupported")
+	h := validate.RequireContentType([]string{"application/json"},
+		validate.WithContentTypeErrorHandler(custom))(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Error("the handler ran for an unsupported media type")
+		}))
+
+	// All three rejection causes must produce the one custom response.
+	for _, ct := range []string{"text/plain", "", "application/json; charset=\x00"} {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{}"))
+		if ct != "" {
+			r.Header.Set("Content-Type", ct)
+		}
+		h.ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Errorf("Content-Type %q: status = %d, want 415", ct, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"error":"unsupported"`) {
+			t.Errorf("Content-Type %q: body = %q, want the custom envelope", ct, rec.Body)
+		}
+	}
+}
+
+func TestNilOptionsAreIgnored(t *testing.T) {
+	// A nil handler must not disable the default response, and a nil option
+	// must not panic — a failed constructor upstream should not silently
+	// remove a rejection.
+	body := validate.MaxBodyBytes(5, nil, validate.WithMaxBodyErrorHandler(nil))(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	rec := httptest.NewRecorder()
+	body.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello world")))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("MaxBodyBytes status = %d, want 413", rec.Code)
+	}
+
+	ct := validate.RequireContentType([]string{"application/json"}, nil,
+		validate.WithContentTypeErrorHandler(nil))(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	rec = httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	r.Header.Set("Content-Type", "text/plain")
+	ct.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("RequireContentType status = %d, want 415", rec.Code)
+	}
 }

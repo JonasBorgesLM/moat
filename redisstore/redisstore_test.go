@@ -117,7 +117,7 @@ func TestCloseDoesNotCloseTheClient(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Take(context.Background(), "k", ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now()); err != nil {
+	if _, err := s.TakeN(context.Background(), "k", 1, ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now()); err != nil {
 		t.Errorf("the client stopped working after Close: %v", err)
 	}
 }
@@ -130,15 +130,15 @@ func TestTakeArguments(t *testing.T) {
 	}
 
 	now := time.Unix(1_700_000_000, 0)
-	if _, err := s.Take(context.Background(), "203.0.113.7", ratelimit.Config{Burst: 10, PerSecond: 2.5}, now); err != nil {
+	if _, err := s.TakeN(context.Background(), "203.0.113.7", 1, ratelimit.Config{Burst: 10, PerSecond: 2.5}, now); err != nil {
 		t.Fatal(err)
 	}
 
 	if len(fake.lastKeys) != 1 || fake.lastKeys[0] != "app1:203.0.113.7" {
 		t.Errorf("keys = %v, want [app1:203.0.113.7]", fake.lastKeys)
 	}
-	if len(fake.lastArgs) != 4 {
-		t.Fatalf("args = %v, want 4 of them", fake.lastArgs)
+	if len(fake.lastArgs) != 5 {
+		t.Fatalf("args = %v, want 5 of them", fake.lastArgs)
 	}
 	if fake.lastArgs[0] != 10 {
 		t.Errorf("burst arg = %v, want 10", fake.lastArgs[0])
@@ -149,6 +149,42 @@ func TestTakeArguments(t *testing.T) {
 	if fake.lastArgs[2] != now.UnixMilli() {
 		t.Errorf("now arg = %v, want %v; the store must use the caller's clock", fake.lastArgs[2], now.UnixMilli())
 	}
+	if fake.lastArgs[4] != 1 {
+		t.Errorf("cost arg = %v, want 1", fake.lastArgs[4])
+	}
+}
+
+// TestTakeNPassesTheCostToTheScript pins that a weighted call is decided by one
+// script invocation rather than by looping, which is what keeps the deduction
+// atomic.
+func TestTakeNPassesTheCostToTheScript(t *testing.T) {
+	fake := &fakeScripter{reply: []any{int64(1), int64(5), int64(0)}}
+	s, _ := New(fake)
+
+	if _, err := s.TakeN(context.Background(), "k", 7, ratelimit.Config{Burst: 20, PerSecond: 1}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.evalShaCalls + fake.evalCalls; got != 1 {
+		t.Errorf("script invocations = %d, want exactly 1; a loop would not be atomic", got)
+	}
+	if len(fake.lastArgs) != 5 || fake.lastArgs[4] != 7 {
+		t.Errorf("args = %v, want the cost 7 in position 5", fake.lastArgs)
+	}
+}
+
+// TestTakeNClampsTheCost pins the Store contract: a weight below 1 must not buy
+// a free request, and the clamp must happen before the script sees it.
+func TestTakeNClampsTheCost(t *testing.T) {
+	for _, n := range []int{0, -1, -1000} {
+		fake := &fakeScripter{reply: []any{int64(1), int64(1), int64(0)}}
+		s, _ := New(fake)
+		if _, err := s.TakeN(context.Background(), "k", n, ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if fake.lastArgs[4] != 1 {
+			t.Errorf("TakeN(n=%d) sent cost %v, want 1", n, fake.lastArgs[4])
+		}
+	}
 }
 
 // TestTakeUsesASingleKey matters for cluster mode: a script touching two keys
@@ -156,7 +192,7 @@ func TestTakeArguments(t *testing.T) {
 func TestTakeUsesASingleKey(t *testing.T) {
 	fake := &fakeScripter{reply: []any{int64(1), int64(1), int64(0)}}
 	s, _ := New(fake)
-	if _, err := s.Take(context.Background(), "k", ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
+	if _, err := s.TakeN(context.Background(), "k", 1, ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.lastKeys) != 1 {
@@ -171,7 +207,7 @@ func TestEvalShaFallsBackToEval(t *testing.T) {
 	fake := &fakeScripter{reply: []any{int64(1), int64(3), int64(0)}, noScript: true}
 	s, _ := New(fake)
 
-	res, err := s.Take(context.Background(), "k", ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
+	res, err := s.TakeN(context.Background(), "k", 1, ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
 	if err != nil {
 		t.Fatalf("Take: %v", err)
 	}
@@ -203,7 +239,7 @@ func TestTakeTimeout(t *testing.T) {
 				opts = append(opts, WithTimeout(tc.timeout))
 			}
 			s, _ := New(fake, opts...)
-			if _, err := s.Take(context.Background(), "k", ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
+			if _, err := s.TakeN(context.Background(), "k", 1, ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
 				t.Fatal(err)
 			}
 			if fake.hadDeadline != tc.wantDeadine {
@@ -215,7 +251,7 @@ func TestTakeTimeout(t *testing.T) {
 	t.Run("a non-positive timeout removes the bound", func(t *testing.T) {
 		fake := &fakeScripter{reply: []any{int64(1), int64(1), int64(0)}}
 		s, _ := New(fake, WithTimeout(0))
-		if _, err := s.Take(context.Background(), "k", ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
+		if _, err := s.TakeN(context.Background(), "k", 1, ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 		if fake.hadDeadline {
@@ -232,7 +268,7 @@ func TestCallerDeadlineWins(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if _, err := s.Take(ctx, "k", ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
+	if _, err := s.TakeN(ctx, "k", 1, ratelimit.Config{Burst: 2, PerSecond: 1}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if time.Until(fake.lastDeadline) > time.Minute {
@@ -259,7 +295,7 @@ func TestErrorsAreNeverConvertedToAnAllow(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := New(&fakeScripter{reply: tc.reply, err: tc.err})
-			res, err := s.Take(context.Background(), "k", ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
+			res, err := s.TakeN(context.Background(), "k", 1, ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
 			if err == nil {
 				t.Fatalf("Take returned no error; result %+v", res)
 			}
@@ -274,7 +310,7 @@ func TestErrorMentionsTheKeyButWrapsTheCause(t *testing.T) {
 	cause := errors.New("connection refused")
 	s, _ := New(&fakeScripter{err: cause})
 
-	_, err := s.Take(context.Background(), "203.0.113.7", ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
+	_, err := s.TakeN(context.Background(), "203.0.113.7", 1, ratelimit.Config{Burst: 5, PerSecond: 1}, time.Now())
 	if !errors.Is(err, cause) {
 		t.Errorf("error = %v, want it to wrap %v so callers can inspect the cause", err, cause)
 	}
@@ -415,7 +451,7 @@ func TestConfigIsNormalized(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeScripter{reply: []any{int64(1), int64(1), int64(0)}}
 			s, _ := New(fake)
-			if _, err := s.Take(context.Background(), "k", tc.cfg, time.Now()); err != nil {
+			if _, err := s.TakeN(context.Background(), "k", 1, tc.cfg, time.Now()); err != nil {
 				t.Fatal(err)
 			}
 			if fake.lastArgs[0] != tc.wantBurst {
@@ -434,7 +470,7 @@ func TestScriptIsEmbedded(t *testing.T) {
 	if len(script) < 500 {
 		t.Fatalf("embedded script is %d bytes; token_bucket.lua did not load", len(script))
 	}
-	for _, needed := range []string{"HMGET", "HSET", "PEXPIRE", "KEYS[1]", "ARGV[4]"} {
+	for _, needed := range []string{"HMGET", "HSET", "PEXPIRE", "KEYS[1]", "ARGV[4]", "ARGV[5]"} {
 		if !strings.Contains(script, needed) {
 			t.Errorf("embedded script does not contain %q", needed)
 		}

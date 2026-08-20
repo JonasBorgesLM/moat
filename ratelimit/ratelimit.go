@@ -23,7 +23,9 @@
 //   - Memory exhaustion of the limiter itself. A map keyed by client address
 //     grows with the number of distinct sources, and a single host with an IPv6
 //     /64 can mint effectively unlimited addresses. [MemoryStore] therefore caps
-//     the number of tracked keys and evicts least-recently-used entries.
+//     the number of tracked keys, discarding the most refilled bucket rather
+//     than the least recently used one — see [MemoryStore] for why that
+//     distinction is the difference between a bound and a bypass.
 //
 // A per-process [MemoryStore] enforces its limit per instance. Behind a load
 // balancer with N instances, the effective limit is N times the configured one;
@@ -137,13 +139,33 @@ type Result struct {
 // now is supplied by the caller so that tests can drive time deterministically.
 // Implementations must not substitute their own clock for it.
 type Store interface {
-	// Take consumes one token from the bucket identified by key, creating a
+	// TakeN consumes n tokens from the bucket identified by key, creating a
 	// full bucket if it does not exist.
-	Take(ctx context.Context, key string, cfg Config, now time.Time) (Result, error)
+	//
+	// All n are taken or none are: a partial deduction would charge a caller
+	// for work it was not allowed to do. n below 1 must be treated as 1, so
+	// that a miscomputed weight cannot turn into a free request.
+	//
+	// An n larger than cfg.Burst can never be satisfied, and must be reported
+	// as a denial rather than as an error — it is a request that costs more
+	// than the bucket can ever hold, which is a decision, not a malfunction.
+	TakeN(ctx context.Context, key string, n int, cfg Config, now time.Time) (Result, error)
 
 	// Close releases any resources held by the store. It must be safe to call
 	// more than once.
 	Close() error
+}
+
+// normalizeCost clamps a weight to the smallest value a bucket may be charged.
+//
+// A cost below 1 is treated as 1 rather than as zero: a weight that arrives
+// miscomputed — an empty list, an integer division that truncated — must not
+// produce a request that passes through the limiter without paying for itself.
+func normalizeCost(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 // KeyFunc derives the rate-limit bucket key for a request.
@@ -388,12 +410,104 @@ func RemoteAddrKey(r *http.Request) (string, error) {
 
 // Take consumes one token for key, bypassing HTTP entirely.
 //
+// It is equivalent to TakeN(ctx, key, 1). It applies no failure policy: the
+// caller decides what a non-nil error means. For the common case where the
+// answer wanted is a yes or no with the configured failure policy already
+// applied, use [Limiter.Allow].
+func (l *Limiter) Take(ctx context.Context, key string) (Result, error) {
+	return l.TakeN(ctx, key, 1)
+}
+
+// TakeN consumes n tokens for key, bypassing HTTP entirely.
+//
 // It is exported so that the same limit can cover non-HTTP work — a background
 // job, a gRPC call, a queue consumer — without a second configuration to keep
-// in sync. It applies no failure policy: the caller decides what a non-nil
-// error means.
-func (l *Limiter) Take(ctx context.Context, key string) (Result, error) {
-	return l.store.Take(ctx, key, l.cfg, l.now())
+// in sync, and so that expensive operations can cost more than cheap ones.
+//
+// n below 1 is treated as 1. An n above [Config.Burst] can never be satisfied
+// and is always denied, with a RetryAfter that reflects a wait that will never
+// end; a weight larger than the bucket is a configuration error, and reporting
+// it as a permanent denial is the fail-closed reading of one.
+//
+// The whole deduction is atomic: n tokens are taken or none are, in a single
+// indivisible store operation. Calling Take in a loop is not equivalent, and is
+// racy — see [Store] on why.
+//
+// It applies no failure policy: the caller decides what a non-nil error means.
+func (l *Limiter) TakeN(ctx context.Context, key string, n int) (Result, error) {
+	return l.store.TakeN(ctx, key, normalizeCost(n), l.cfg, l.now())
+}
+
+// Allow reports whether a request for key may proceed, consuming one token if
+// it may.
+//
+// It is equivalent to AllowN(ctx, key, 1).
+func (l *Limiter) Allow(ctx context.Context, key string) bool {
+	return l.AllowN(ctx, key, 1)
+}
+
+// AllowN reports whether an operation for key costing n tokens may proceed,
+// consuming them if it may.
+//
+// This is the form to use inside a handler, where the identity that should be
+// limited — an account ID, an API key, a tenant — is known only after
+// authentication and so cannot be derived by the middleware from the request
+// alone:
+//
+//	if !limiter.AllowN(r.Context(), account.ID, report.Cost()) {
+//	    writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+//	    return
+//	}
+//
+// Unlike [Limiter.TakeN] it applies the configured [FailureMode]: a store
+// outage returns false under [FailClosed] and true under [FailOpen], and either
+// way the error reaches [WithOnError]. That is the whole difference between the
+// two — use TakeN when you want to see the error and decide yourself.
+//
+// It deliberately returns a bare bool rather than a Result. A caller that wants
+// the remaining allowance or a retry hint is asking a different question and
+// should call TakeN, whose answer includes both; folding them into this
+// signature would make the common case carry values it does not use.
+//
+// n below 1 is treated as 1, and n above [Config.Burst] is always denied.
+func (l *Limiter) AllowN(ctx context.Context, key string, n int) bool {
+	_, out := l.evaluate(ctx, key, n)
+	return out == outcomeAllowed || out == outcomeFailedOpen
+}
+
+// outcome is the decision after the failure policy has been applied. It exists
+// so that the middleware and [Limiter.AllowN] share one copy of that policy
+// instead of each interpreting a (Result, error) pair their own way.
+type outcome int
+
+const (
+	// outcomeAllowed: the store granted the tokens.
+	outcomeAllowed outcome = iota
+	// outcomeDenied: the store refused; the client is over its limit.
+	outcomeDenied
+	// outcomeStoreError: the store failed and the policy is FailClosed.
+	outcomeStoreError
+	// outcomeFailedOpen: the store failed and the policy is FailOpen. It is
+	// distinct from outcomeAllowed because there is no Result to report, so a
+	// caller must not publish rate-limit headers derived from one.
+	outcomeFailedOpen
+)
+
+// evaluate takes n tokens and applies the failure policy. It is the single
+// place that policy lives.
+func (l *Limiter) evaluate(ctx context.Context, key string, n int) (Result, outcome) {
+	res, err := l.TakeN(ctx, key, n)
+	if err != nil {
+		l.report(err)
+		if l.failure == FailOpen {
+			return Result{}, outcomeFailedOpen
+		}
+		return Result{}, outcomeStoreError
+	}
+	if !res.Allowed {
+		return res, outcomeDenied
+	}
+	return res, outcomeAllowed
 }
 
 // Config returns the limits this Limiter enforces.
@@ -437,24 +551,23 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		res, err := l.store.Take(r.Context(), key, l.cfg, l.now())
-		if err != nil {
-			l.report(err)
-			if l.failure == FailOpen {
-				next.ServeHTTP(w, r)
-				return
-			}
+		res, out := l.evaluate(r.Context(), key, 1)
+		switch out {
+		case outcomeStoreError:
 			l.writeStoreError(w, r)
-			return
-		}
-
-		l.writeHeaders(w, res)
-		if !res.Allowed {
+		case outcomeFailedOpen:
+			// No Result to report, so no headers: publishing a zeroed
+			// allowance would tell clients they are throttled when the truth
+			// is that the limiter could not decide.
+			next.ServeHTTP(w, r)
+		case outcomeDenied:
+			l.writeHeaders(w, res)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(res.RetryAfter)))
 			l.writeDenied(w, r)
-			return
+		default:
+			l.writeHeaders(w, res)
+			next.ServeHTTP(w, r)
 		}
-		next.ServeHTTP(w, r)
 	})
 }
 

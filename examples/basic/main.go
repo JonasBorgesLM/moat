@@ -27,6 +27,7 @@ import (
 	"github.com/JonasBorgesLM/moat/pathguard"
 	"github.com/JonasBorgesLM/moat/ratelimit"
 	"github.com/JonasBorgesLM/moat/sanitize"
+	"github.com/JonasBorgesLM/moat/secret"
 	"github.com/JonasBorgesLM/moat/secureheaders"
 	"github.com/JonasBorgesLM/moat/validate"
 )
@@ -65,22 +66,26 @@ func main() {
 // It fails rather than generating one, because a per-process secret means every
 // token issued by one instance is rejected by every other, and the resulting
 // intermittent 403s look exactly like a bug in the CSRF library.
-func loadSecret() ([]byte, error) {
+func loadSecret() (secret.Value, error) {
 	raw := os.Getenv("CSRF_SECRET")
 	if raw == "" {
-		return nil, errors.New("CSRF_SECRET is not set; generate one with `go run github.com/JonasBorgesLM/moat/cmd/moat-secret`")
+		return secret.Value{}, errors.New("CSRF_SECRET is not set; generate one with `go run github.com/JonasBorgesLM/moat/cmd/moat-secret`")
 	}
-	secret, err := base64.StdEncoding.DecodeString(raw)
+	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return nil, fmt.Errorf("CSRF_SECRET is not valid base64: %w", err)
+		// The error deliberately does not echo the offending value back: it is
+		// the secret, and a startup error is the first thing to reach a log.
+		return secret.Value{}, fmt.Errorf("CSRF_SECRET is not valid base64: %w", err)
 	}
-	return secret, nil
+	// Wrap at the boundary, so the raw bytes exist only inside this function
+	// and everything downstream holds something that cannot be printed.
+	return secret.New(decoded), nil
 }
 
 // newServer builds the whole handler. It is separate from main so that the
 // smoke test can drive it without binding a port.
-func newServer(secret []byte, publicDir string) (http.Handler, func(), error) {
-	protector, err := csrf.New(secret)
+func newServer(key secret.Value, publicDir string) (http.Handler, func(), error) {
+	protector, err := csrf.New(key)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -45,23 +45,28 @@ func main() {
 // run is separated from main so that it can be tested without spawning a
 // process or capturing the real stdout.
 func run(format string, out *os.File) error {
-	secret, err := csrf.GenerateSecret()
+	value, err := csrf.GenerateSecret()
 	if err != nil {
 		return err
 	}
+	// This is the one place in the project that deliberately unwraps a
+	// secret.Value: printing is the whole purpose of the command, so the
+	// unwrap is the intent rather than an accident. Everywhere else the Value
+	// is passed along unopened.
+	raw := value.Bytes()
 
 	var encoded string
 	switch format {
 	case "base64":
-		encoded = base64.StdEncoding.EncodeToString(secret)
+		encoded = base64.StdEncoding.EncodeToString(raw)
 	case "hex":
-		encoded = hex.EncodeToString(secret)
+		encoded = hex.EncodeToString(raw)
 	case "raw":
 		// Raw bytes, for writing straight into a file or a secret store. No
 		// newline: a trailing newline silently becomes part of the secret when
 		// the file is read back whole, and then the secret differs between the
 		// process that wrote it and the one that reads it.
-		_, err := out.Write(secret)
+		_, err := out.Write(raw)
 		return err
 	default:
 		return fmt.Errorf("unknown format %q: want base64, hex, or raw", format)

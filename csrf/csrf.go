@@ -73,6 +73,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -80,7 +81,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/JonasBorgesLM/moat/secret"
 )
 
 // MinSecretLen is the shortest server secret [New] accepts.
@@ -130,12 +135,45 @@ type contextKey struct{}
 // and overwrite the token with one of its own choosing.
 var tokenKey contextKey
 
+// tokenHolder is what actually goes in the context, rather than the token
+// string itself.
+//
+// The indirection exists so that [Protector.Rotate] can replace the token for a
+// request that is already in flight. If the context held a plain string, a
+// handler that rotated on login and then called [Token] would receive the token
+// from *before* the rotation, render it into the page, and every subsequent
+// POST would be rejected — reintroducing by another route exactly the silent
+// staleness that Token's (string, bool) signature exists to prevent.
+//
+// The mutex is not ceremony: a handler may hand the request to goroutines, and
+// then Rotate and Token can genuinely run concurrently.
+type tokenHolder struct {
+	mu    sync.RWMutex
+	token string
+}
+
+func (h *tokenHolder) get() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.token
+}
+
+func (h *tokenHolder) set(token string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.token = token
+}
+
 // Protector issues and verifies CSRF tokens.
 //
 // It is safe for concurrent use and is intended to be created once at startup
 // and shared. The zero value is not usable; create one with [New].
 type Protector struct {
 	secret []byte
+
+	// optErr carries a problem found while applying options, so that [New] can
+	// report it. Options cannot return an error themselves.
+	optErr error
 
 	cookieName   string
 	fieldName    string
@@ -155,23 +193,25 @@ type Option func(*Protector)
 
 // New returns a Protector that signs tokens with secret.
 //
-// secret must be at least [MinSecretLen] bytes of cryptographically random
-// data, and must be identical across every instance of your application and
-// stable across deploys. Generate one with [GenerateSecret], store it wherever
-// you keep other secrets, and load it at startup.
+// key must be at least [MinSecretLen] bytes of cryptographically random data,
+// and must be identical across every instance of your application and stable
+// across deploys. Generate one with [GenerateSecret], store it wherever you
+// keep other secrets, and load it at startup.
 //
 // Do not generate a fresh secret per process. Every token issued by one process
 // is then rejected by every other, producing intermittent 403s that look like a
 // bug in this library and get "fixed" by disabling CSRF protection.
 //
-// New copies the secret, so the caller may reuse or zero the slice afterwards.
-func New(secret []byte, opts ...Option) (*Protector, error) {
-	if len(secret) < MinSecretLen {
-		return nil, fmt.Errorf("%w (got %d)", ErrSecretTooShort, len(secret))
+// The secret is a [secret.Value] rather than a []byte so that it cannot reach a
+// log through an accidental Printf or a marshalled config struct. Load one from
+// your secret store with [secret.New], or generate one with [GenerateSecret].
+func New(key secret.Value, opts ...Option) (*Protector, error) {
+	if key.Len() < MinSecretLen {
+		return nil, fmt.Errorf("%w (got %d)", ErrSecretTooShort, key.Len())
 	}
 
 	p := &Protector{
-		secret:     append([]byte(nil), secret...),
+		secret:     key.Bytes(),
 		cookieName: DefaultCookieName,
 		fieldName:  DefaultFieldName,
 		headerName: DefaultHeaderName,
@@ -184,6 +224,9 @@ func New(secret []byte, opts ...Option) (*Protector, error) {
 		if opt != nil {
 			opt(p)
 		}
+	}
+	if p.optErr != nil {
+		return nil, p.optErr
 	}
 
 	// A browser rejects a __Host- cookie that is not Secure, not Path=/, or
@@ -204,21 +247,23 @@ func (p *Protector) hostPrefixValid() bool {
 }
 
 // GenerateSecret returns [MinSecretLen] cryptographically random bytes suitable
-// for [New].
+// for [New], wrapped in a [secret.Value].
 //
 // It returns the value and never prints it. A library that writes a secret to
 // stdout is unusable in a real application: the value lands in CI logs, in
-// container logs, and in whatever aggregates them. Store the result the way you
-// store other secrets.
+// container logs, and in whatever aggregates them. The [secret.Value] wrapper
+// extends that guarantee past this function: the result cannot be printed,
+// marshalled or logged by accident either, and the raw bytes come out only
+// through an explicit Bytes call.
 //
 // The cmd/moat-secret helper wraps this for command-line use, where
 // printing is the caller's explicit intent rather than a library's side effect.
-func GenerateSecret() ([]byte, error) {
-	secret := make([]byte, MinSecretLen)
-	if _, err := rand.Read(secret); err != nil {
-		return nil, fmt.Errorf("csrf: generating secret: %w", err)
+func GenerateSecret() (secret.Value, error) {
+	b := make([]byte, MinSecretLen)
+	if _, err := rand.Read(b); err != nil {
+		return secret.Value{}, fmt.Errorf("csrf: generating secret: %w", err)
 	}
-	return secret, nil
+	return secret.New(b), nil
 }
 
 // WithCookieName sets the cookie name.
@@ -326,10 +371,20 @@ func WithInsecureCookie() Option {
 // rejections rather than as a silently widened allow-list.
 func WithTrustedOrigins(origins ...string) Option {
 	return func(p *Protector) {
-		p.trustedOrigins = make([]string, 0, len(origins))
+		trusted := make([]string, 0, len(origins))
 		for _, o := range origins {
-			p.trustedOrigins = append(p.trustedOrigins, strings.ToLower(strings.TrimSuffix(o, "/")))
+			if o = strings.TrimSpace(o); o == "" {
+				continue
+			}
+			trusted = append(trusted, strings.ToLower(strings.TrimSuffix(o, "/")))
 		}
+		if len(trusted) == 0 {
+			// Recorded rather than ignored: silently keeping the Host-matching
+			// default is the failure this refuses. See [ErrNoTrustedOrigins].
+			p.optErr = ErrNoTrustedOrigins
+			return
+		}
+		p.trustedOrigins = trusted
 	}
 }
 
@@ -370,8 +425,12 @@ func Token(r *http.Request) (string, bool) {
 	if r == nil {
 		return "", false
 	}
-	token, ok := r.Context().Value(tokenKey).(string)
-	if !ok || token == "" {
+	holder, ok := r.Context().Value(tokenKey).(*tokenHolder)
+	if !ok || holder == nil {
+		return "", false
+	}
+	token := holder.get()
+	if token == "" {
 		return "", false
 	}
 	return token, true
@@ -405,8 +464,8 @@ func Token(r *http.Request) (string, bool) {
 //
 //  2. **Token.** The token is taken from the [DefaultHeaderName] header, or,
 //     when the request is form-encoded, from the [DefaultFieldName] form field.
-//     It is compared with HMAC-SHA256 of the presented cookie using
-//     crypto/hmac.Equal.
+//     It is unmasked (see [maskToken]) and the recovered value is compared with
+//     HMAC-SHA256 of the presented cookie using crypto/hmac.Equal.
 //
 // # Why the form field is gated on Content-Type
 //
@@ -424,7 +483,12 @@ func Token(r *http.Request) (string, bool) {
 // without one, an attacker sends a form body of arbitrary size and this
 // middleware parses it. The preset package fixes this ordering for you.
 func (p *Protector) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// Wrapped so that [Protector.Rotate] can detect being called after the
+		// response has begun, instead of writing a Set-Cookie that net/http
+		// silently drops. See responseRecorder.
+		w := &responseRecorder{ResponseWriter: rw}
+
 		cookieValue, err := p.cookieValue(r)
 		if err != nil {
 			// No usable cookie: mint one. Doing this even on an unsafe request
@@ -438,8 +502,14 @@ func (p *Protector) Middleware(next http.Handler) http.Handler {
 			p.setCookie(w, cookieValue)
 		}
 
-		token := p.sign(cookieValue)
-		r = r.WithContext(context.WithValue(r.Context(), tokenKey, token))
+		expected := p.sign(cookieValue)
+		token, err := maskToken(expected)
+		if err != nil {
+			// The system CSPRNG failed. There is no safe way to continue.
+			p.reject(w, r, "")
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), tokenKey, &tokenHolder{token: token}))
 
 		if isSafeMethod(r.Method) {
 			next.ServeHTTP(w, r)
@@ -449,7 +519,7 @@ func (p *Protector) Middleware(next http.Handler) http.Handler {
 			p.reject(w, r, token)
 			return
 		}
-		if !p.tokenOK(r, token) {
+		if !p.tokenOK(r, expected) {
 			p.reject(w, r, token)
 			return
 		}
@@ -465,7 +535,8 @@ func (p *Protector) cookieValue(r *http.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(c.Value)
+	// Strict for the same reason as [unmaskToken]: one value, one encoding.
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(c.Value)
 	if err != nil || len(raw) != cookieBytes {
 		return "", http.ErrNoCookie
 	}
@@ -513,11 +584,79 @@ func (p *Protector) setCookie(w http.ResponseWriter, value string) {
 	http.SetCookie(w, c)
 }
 
-// sign derives the token for a cookie value.
-func (p *Protector) sign(cookieValue string) string {
+// sign derives the raw MAC for a cookie value. It is never handed out directly;
+// see [maskToken] for why.
+func (p *Protector) sign(cookieValue string) []byte {
 	mac := hmac.New(sha256.New, p.secret)
 	mac.Write([]byte(cookieValue))
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return mac.Sum(nil)
+}
+
+// maskedTokenBytes is the wire length of an issued token: a random pad followed
+// by the MAC XOR that pad.
+const maskedTokenBytes = 2 * sha256.Size
+
+// maskToken wraps a raw MAC in a fresh one-time pad, so that the token a page
+// carries is different on every response.
+//
+// # Why the token cannot be sent as-is
+//
+// The MAC is a pure function of the cookie, so an unmasked token is byte
+// identical in every response for the lifetime of that cookie. That is the
+// precondition for BREACH: an application that serves compressed HTML and
+// reflects any attacker-influenced string into the same response — a search
+// term, a username, an echoed error, a ?utm_ parameter — becomes an adaptive
+// compression oracle. The attacker submits guesses, a correct prefix compresses
+// shorter, and the token falls out byte by byte. With it, every request the
+// victim's browser can be made to issue is forgeable until the cookie rotates,
+// which it does only on an explicit [Protector.Rotate].
+//
+// Masking removes the precondition rather than the compression: two responses
+// carrying the same underlying MAC share no bytes, so there is nothing for the
+// oracle to converge on. This is the same construction gorilla/csrf uses, and
+// the parity matters — a reviewer comparing the two should not find this one
+// weaker at the point it claims to have handled carefully.
+//
+// Only the token needs this. The cookie is HttpOnly and never appears in a
+// compressed response body.
+func maskToken(raw []byte) (string, error) {
+	out := make([]byte, maskedTokenBytes)
+	pad := out[:sha256.Size]
+	if _, err := rand.Read(pad); err != nil {
+		return "", err
+	}
+	// XORBytes rather than an indexed loop: it writes exactly
+	// min(len(raw), len(pad)) bytes into a destination it has checked, so the
+	// bounds are provable here instead of resting on sign always returning
+	// sha256.Size bytes.
+	subtle.XORBytes(out[sha256.Size:], raw, pad)
+	return base64.RawURLEncoding.EncodeToString(out), nil
+}
+
+// unmaskToken recovers the raw MAC from a submitted token.
+//
+// Everything it inspects — the encoding, the length, the pad — comes from the
+// request, so no branch here depends on the secret and none of it is a timing
+// side channel on anything the attacker does not already know. The
+// constant-time comparison happens afterwards, on the recovered bytes.
+func unmaskToken(token string) ([]byte, bool) {
+	// Strict, so that a token has exactly one valid encoding. Go's default
+	// base64 decoder ignores the unused trailing bits of the final character:
+	// 64 bytes occupy 86 base64url characters, of which the last carries four
+	// significant bits and two that are discarded. Without Strict, two distinct
+	// strings decode to the same token and mutating that character is a no-op
+	// about a quarter of the time — which is not a vulnerability, since the
+	// attacker still has to know the MAC, but it does mean "the token I sent is
+	// not the token that was issued" and "the request is refused" stop being the
+	// same statement. Canonical encoding keeps them the same.
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(token)
+	if err != nil || len(decoded) != maskedTokenBytes {
+		return nil, false
+	}
+	pad, masked := decoded[:sha256.Size], decoded[sha256.Size:]
+	raw := make([]byte, sha256.Size)
+	subtle.XORBytes(raw, masked, pad)
+	return raw, true
 }
 
 // tokenOK reports whether the request presents the token matching its cookie.
@@ -529,12 +668,19 @@ func (p *Protector) sign(cookieValue string) string {
 // hundreds of guesses instead of 2^256. Whether that timing is measurable
 // across a real network is debatable; the constant-time comparison costs
 // nothing, so there is no version of this trade-off worth taking.
-func (p *Protector) tokenOK(r *http.Request, expected string) bool {
+func (p *Protector) tokenOK(r *http.Request, expected []byte) bool {
 	submitted := p.submittedToken(r)
 	if submitted == "" {
 		return false
 	}
-	return hmac.Equal([]byte(submitted), []byte(expected))
+	// Unmask first: the presented token carries a per-response pad, so two
+	// encodings of the same MAC share no bytes and comparing them directly
+	// would reject every valid request. See [maskToken].
+	raw, ok := unmaskToken(submitted)
+	if !ok {
+		return false
+	}
+	return hmac.Equal(raw, expected)
 }
 
 // submittedToken extracts the token from the request, consulting the body only
@@ -636,7 +782,7 @@ func (p *Protector) originMatches(origin, requestHost string) bool {
 func (p *Protector) reject(w http.ResponseWriter, r *http.Request, token string) {
 	if p.errorHandler != nil {
 		if token != "" {
-			r = r.WithContext(context.WithValue(r.Context(), tokenKey, token))
+			r = r.WithContext(context.WithValue(r.Context(), tokenKey, &tokenHolder{token: token}))
 		}
 		p.errorHandler.ServeHTTP(w, r)
 		return
@@ -652,4 +798,234 @@ func isSafeMethod(method string) bool {
 		return true
 	}
 	return false
+}
+
+// Rotate replaces the CSRF cookie in the client's browser with a fresh random
+// value and returns the token that matches it.
+//
+// # Call this at every privilege change
+//
+// Session fixation applied to CSRF: an attacker who can plant a cookie in the
+// victim's browser — through a subdomain they control, a network position on a
+// plaintext sibling origin, or any other cookie-injection route — knows the
+// cookie value and can therefore compute the token that goes with it. If that
+// cookie survives the victim logging in, the attacker holds a token that
+// matches what the victim's browser will send, and a forged request from the
+// victim's browser verifies.
+//
+// Rotating on login breaks that. The Set-Cookie overwrites the planted value,
+// so from that point the victim's browser sends a cookie the attacker never
+// saw, and the token they precomputed no longer matches it. Call it immediately
+// after authenticating, and again on anything else that changes what the
+// session may do — assuming another user, elevating to an admin mode,
+// completing a second factor.
+//
+// # What rotation is not
+//
+// It is not server-side revocation, and it cannot be. This scheme is stateless
+// by design (§4.3): a token is `HMAC(serverSecret, cookieValue)` and is verified
+// by recomputation, so there is no list of issued tokens to strike anything
+// from. An old cookie paired with its old token still verifies if something
+// presents both.
+//
+// That is not the attack. A CSRF attack needs the *victim's browser* to send
+// the credential-bearing cookie, and after rotation the victim's browser holds
+// the new value. An attacker who kept the old pair can present it only from
+// their own browser, carrying their own session, which achieves nothing.
+//
+// If you need to revoke tokens across the board — a compromised server secret,
+// for instance — rotate the secret passed to [New] and redeploy. That
+// invalidates every token everywhere, at the cost of one rejection for every
+// user with a form already open.
+//
+// # It does not rotate your session identifier
+//
+// This is the limitation most likely to be misread, because calling Rotate at
+// login looks like it handles session fixation. It does not. It rotates the
+// **CSRF** secret and nothing else. Classic session fixation — an attacker
+// fixing the victim's *session* cookie before login and then riding the
+// authenticated session — is defeated by issuing a new session identifier at
+// the privilege change, which is your session layer's job and which this
+// package has no access to.
+//
+// Rotate closes the CSRF half. Rotating the session ID closes the other half.
+// A login that does only one of the two is still vulnerable to the other, and
+// doing only this one is the easier mistake to make.
+//
+// The __Host- cookie prefix (see [WithCookieName]) already blocks the most
+// common injection route by stopping a subdomain from overwriting the cookie.
+// Rotation is the defence for the cases the prefix does not cover, and the two
+// are complementary rather than alternatives.
+//
+// # Ordering, and how a mistake is reported
+//
+// Rotate writes a Set-Cookie header, so it must be called before anything is
+// written to w — before WriteHeader, before the first Write, and before any
+// redirect. Afterwards, net/http has already serialized the header block and
+// discards the cookie without complaint.
+//
+// That failure is detected rather than merely documented. The middleware wraps
+// the ResponseWriter to note when the response begins, and a late Rotate
+// returns [ErrHeadersAlreadySent] and changes nothing, instead of reporting
+// success while leaving the old cookie in place. Check the error.
+//
+// Detection needs the middleware's wrapper to be reachable from the w you pass.
+// It is found through the [http.ResponseWriter] Unwrap convention, so
+// intervening middleware that follows that convention does not hide it. If no
+// wrapper is found — Rotate called on a route outside the protected chain —
+// rotation still happens; only the late-call check is unavailable, because a
+// safety net must not be able to disable the thing it guards.
+//
+// A request that already carries a valid cookie receives exactly one
+// Set-Cookie. A request that arrived without one and passed through
+// [Protector.Middleware] receives two — the middleware minted one before the
+// handler ran, and Rotate replaced it. Both name the same cookie and the last
+// wins, so the result is correct; it is mentioned only because it is visible
+// when reading the raw response.
+//
+// # It updates the token for this request too
+//
+// After Rotate returns, [Token] on the same request reports the new token, so a
+// handler that logs the user in and then renders a page does not have to thread
+// the return value through its template data to stay correct. The return value
+// is there for convenience, not because ignoring it is a bug.
+//
+// # Errors
+//
+// A non-nil error means the system CSPRNG failed and no new secret could be
+// generated. The old cookie is left in place and unchanged. Abort the privilege
+// change rather than continuing: proceeding would complete a login while
+// leaving a possibly attacker-known token valid, which is the exact state
+// rotation exists to leave behind.
+//
+// Rotate does not require the request to have passed through
+// [Protector.Middleware], so it can be used on a login route that is mounted
+// outside the protected chain. When it has, the context is updated in place.
+func (p *Protector) Rotate(w http.ResponseWriter, r *http.Request) (string, error) {
+	if w == nil || r == nil {
+		return "", ErrNoToken
+	}
+	// Checked before anything is generated or written: once the response has
+	// begun, the Set-Cookie below would be discarded by net/http and the caller
+	// would be told it had rotated when it had not.
+	if rr := findRecorder(w); rr != nil && rr.wroteHeader.Load() {
+		return "", ErrHeadersAlreadySent
+	}
+
+	cookieValue, err := newCookieValue()
+	if err != nil {
+		return "", fmt.Errorf("csrf: rotating token: %w", err)
+	}
+	p.setCookie(w, cookieValue)
+	token, err := maskToken(p.sign(cookieValue))
+	if err != nil {
+		return "", fmt.Errorf("csrf: rotating token: %w", err)
+	}
+
+	// Update the in-flight request so a later Token call cannot hand back the
+	// pre-rotation value. When the request never went through the middleware
+	// there is no holder, and the caller uses the return value.
+	if holder, ok := r.Context().Value(tokenKey).(*tokenHolder); ok && holder != nil {
+		holder.set(token)
+	}
+	return token, nil
+}
+
+// ErrHeadersAlreadySent reports that [Protector.Rotate] was called after the
+// response had already begun, so the new cookie could not be set.
+//
+// It exists because the alternative is silent. Once a handler has called
+// WriteHeader — or written a single byte, which calls it implicitly — net/http
+// has already serialized the header block, and any Set-Cookie added afterwards
+// is discarded without complaint. The handler would go on believing it had
+// rotated, the browser would keep the old cookie, and the fixation that
+// rotation exists to close would still be open. Failing loudly turns that into
+// a bug you find in testing.
+//
+// Recover by rotating earlier in the handler, before anything is written.
+var ErrHeadersAlreadySent = errors.New("csrf: response headers already sent; Rotate must be called before writing the response")
+
+// ErrNoTrustedOrigins reports that [WithTrustedOrigins] was given no usable
+// origin.
+//
+// An empty list is refused rather than quietly meaning "keep the default",
+// because the overwhelmingly likely cause is an unset environment variable
+// feeding a slice — `WithTrustedOrigins(cfg.AllowedOrigins...)` where the config
+// never loaded. Accepting it would leave the operator believing that scheme and
+// host are pinned while verification had silently reverted to matching the
+// request's own Host: the scheme is then unpinned and any sibling subdomain
+// restriction is gone.
+//
+// This mirrors realip.ErrNoTrustedProxies, which refuses the same input shape
+// for the same reason. If you want the Host-based default, do not pass the
+// option at all — that is what it means.
+var ErrNoTrustedOrigins = errors.New("csrf: WithTrustedOrigins was given no usable origin")
+
+// responseRecorder notes whether the response has begun.
+//
+// It records rather than intercepts: every method delegates, and the only extra
+// behaviour is a flag. WriteHeader sets it directly; Write sets it too, because
+// the first Write triggers an implicit WriteHeader(200) and is just as final.
+//
+// The flag is atomic because a handler may write from one goroutine while
+// another calls Rotate — the same concurrency the token holder is protected
+// against, and the race detector finds it in exactly the same way.
+type responseRecorder struct {
+	http.ResponseWriter
+	wroteHeader atomic.Bool
+}
+
+func (rr *responseRecorder) WriteHeader(statusCode int) {
+	rr.wroteHeader.Store(true)
+	rr.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (rr *responseRecorder) Write(b []byte) (int, error) {
+	rr.wroteHeader.Store(true)
+	return rr.ResponseWriter.Write(b)
+}
+
+// Unwrap exposes the underlying ResponseWriter to [http.ResponseController].
+//
+// Wrapping a ResponseWriter otherwise hides whatever optional interfaces the
+// real one implements, so a handler further down that needs to flush a stream
+// or hijack the connection would find those capabilities gone. ResponseController
+// follows Unwrap to reach them, so Flush, Hijack, SetReadDeadline and the rest
+// keep working through this middleware:
+//
+//	rc := http.NewResponseController(w)
+//	if err := rc.Flush(); err != nil { ... }
+//
+// Note the limitation this does not remove: a *direct* type assertion such as
+// w.(http.Flusher) does not follow Unwrap and will not match this wrapper. That
+// is the assertion http.ResponseController was introduced to replace, and code
+// behind this middleware should use the controller instead.
+func (rr *responseRecorder) Unwrap() http.ResponseWriter { return rr.ResponseWriter }
+
+// findRecorder walks the Unwrap chain looking for this package's recorder.
+//
+// The handler does not necessarily hold the recorder directly: middleware
+// mounted between this one and the handler may have wrapped it again. Walking
+// the chain finds it through those wrappers, provided they follow the same
+// Unwrap convention. If none is found, rotation proceeds without the check —
+// the detection is a safety net, and its absence must not disable rotation.
+//
+// The walk is bounded so that a wrapper whose Unwrap returns a cycle cannot
+// hang the request.
+func findRecorder(w http.ResponseWriter) *responseRecorder {
+	for range 16 {
+		if rr, ok := w.(*responseRecorder); ok {
+			return rr
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		next := u.Unwrap()
+		if next == nil || next == w {
+			return nil
+		}
+		w = next
+	}
+	return nil
 }

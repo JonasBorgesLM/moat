@@ -221,6 +221,9 @@ jobs:
       - name: validate rules
         run: go test -run=XXX -fuzz=FuzzRules -fuzztime=30s ./validate
 
+      - name: realip cannot be steered by forged headers
+        run: go test -run=XXX -fuzz=FuzzForgedHeaders -fuzztime=30s ./realip
+
       # A crasher is written to testdata/fuzz and would otherwise be lost with
       # the runner. Keeping it means the failing input can be added as a seed.
       - name: Upload any crashers
