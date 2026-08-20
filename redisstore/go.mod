@@ -8,8 +8,16 @@ go 1.25.0
 
 toolchain go1.26.6
 
+// v0.2.0 was published requiring the core module at v0.1.0, whose
+// ratelimit.Store interface still declares Take rather than TakeN. *Store
+// therefore does not satisfy ratelimit.Store for anyone resolving it fresh from
+// the proxy, and the module does not compile. The local development workspace
+// resolved the core against the working tree, so nothing caught it before the
+// tag. Use v0.2.1.
+retract v0.2.0
+
 require (
-	github.com/JonasBorgesLM/moat v0.1.0
+	github.com/JonasBorgesLM/moat v0.2.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 )

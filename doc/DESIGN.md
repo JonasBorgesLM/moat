@@ -1693,6 +1693,33 @@ plaintext origin usually has no cookie to send — but it is the same input shap
 reason, and that `preset` already guards with `if len(...) > 0`. Direct `csrf`
 users had neither. Now `ErrNoTrustedOrigins`, reported through `New`.
 
+### 6.16 The workspace hid a stale cross-module version pin
+
+`redisstore/v0.2.0` was tagged and pushed with `go.mod` still requiring the core
+at `v0.1.0`. Since v0.2.0 renamed `ratelimit.Store.Take` to `TakeN`, the
+published module did not satisfy the interface it exists to implement and did
+not compile for anyone resolving it from the proxy.
+
+Every local signal was green, and necessarily so. `go.work` lists all three
+modules under `use`, which makes `redisstore` resolve the core against the
+working tree and the `require` line inert. Building, vetting, testing and
+fuzzing from inside the repository cannot detect a stale cross-module pin,
+because inside the repository the pin is not used. This is the same shape as the
+findings in §6.13 and §6.15 — a check that passes for a reason unrelated to the
+property it is believed to prove.
+
+What caught it was the release step that fetches the published tag into a clean
+directory outside the repository and runs real code against it. That step is
+therefore not a formality at the end of a release; it is the only check in the
+process that exercises inter-module version resolution at all. `redisstore`'s
+tag was reissued as v0.2.1 with `retract v0.2.0`, since a published tag is
+immutable once the proxy has cached it.
+
+**Standing item:** any release that changes an API the satellite modules consume
+must bump their `require` on the core *before* tagging, and the clean-room fetch
+must run against the real tags rather than a `replace`. Running the satellite
+test suites with `GOWORK=off` before tagging would have caught this locally.
+
 ---
 
 ## 7. Testing strategy

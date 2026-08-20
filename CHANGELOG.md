@@ -9,6 +9,27 @@ change to upgrade.
 This project is pre-1.0. Breaking changes may occur in a minor release, which is
 what v0 signals — see `doc/DESIGN.md` §8.
 
+## redisstore/v0.2.1
+
+**`redisstore/v0.2.0` is retracted. Upgrade to v0.2.1.**
+
+`redisstore/v0.2.0` was published with `go.mod` still requiring the core module
+at `v0.1.0`, whose `ratelimit.Store` interface declares `Take` rather than
+`TakeN`. Resolved fresh from the module proxy, `*redisstore.Store` therefore did
+not satisfy `ratelimit.Store` and the module did not compile:
+
+```
+cannot use (*Store)(nil) as ratelimit.Store value: missing method Take
+```
+
+Nothing local could see it: the development workspace lists all three modules
+under `use`, so `redisstore` resolved the core against the working tree and the
+stale `require` was never exercised. It was caught by fetching the published tag
+into a clean directory outside the repository and running real code against it.
+
+v0.2.1 requires the core at `v0.2.0` and carries a `retract v0.2.0` directive.
+The core module's own `v0.2.0` tag is unaffected and needs no reissue.
+
 ## v0.2.0
 
 Modules: `github.com/JonasBorgesLM/moat` and

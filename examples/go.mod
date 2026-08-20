@@ -10,7 +10,7 @@ go 1.25.0
 toolchain go1.26.6
 
 require (
-	github.com/JonasBorgesLM/moat v0.1.0
+	github.com/JonasBorgesLM/moat v0.2.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/labstack/echo/v4 v4.15.4
 )
