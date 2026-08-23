@@ -1,6 +1,7 @@
 package redisstore_test
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -84,4 +85,44 @@ func ExampleNew_failOpen() {
 		ratelimit.WithOnError(func(err error) { _ = err }),
 	)
 	defer limiter.Close()
+}
+
+// ExampleStore_EvictionCheck surfaces a check that was skipped.
+//
+// [redisstore.New] refuses to build a Store against a server it can see will
+// evict keys, because eviction silently resets rate limits. What it cannot do is
+// establish that everywhere: on ElastiCache, MemoryDB, Upstash and Azure Cache,
+// CONFIG is disabled or renamed, so the check is skipped and construction
+// proceeds. Those are also where most production deployments run — the check is
+// loudest in local Docker and quietest in production.
+//
+// So a Store that constructed without error has not necessarily been verified.
+// Asking is one line, and belongs in startup logging next to the other
+// configuration a deployment cannot infer for itself.
+//
+// This example is compile-only: it needs a reachable Redis.
+func ExampleStore_EvictionCheck() {
+	client := redis.NewClient(&redis.Options{
+		Addr:         "localhost:6379",
+		DialTimeout:  200 * time.Millisecond,
+		ReadTimeout:  200 * time.Millisecond,
+		WriteTimeout: 200 * time.Millisecond,
+	})
+	defer client.Close()
+
+	store, err := redisstore.New(client)
+	if err != nil {
+		// Includes redisstore.ErrUnsafeEvictionPolicy: the server was asked and
+		// answered that it evicts.
+		log.Fatalf("redis store: %v", err)
+	}
+	defer store.Close()
+
+	// Not an error, and not necessarily a problem — but it is the difference
+	// between "this server will not evict" and "nobody asked". Only the operator
+	// can close that gap, and only if they are told it is open.
+	if check := store.EvictionCheck(); !check.Verified() {
+		log.Printf("redisstore: eviction policy unverified (%s); "+
+			"confirm maxmemory-policy is noeviction on every node", check)
+	}
 }

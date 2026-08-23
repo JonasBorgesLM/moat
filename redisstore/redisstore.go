@@ -200,6 +200,80 @@ type Store struct {
 	// allowEviction records an explicit [InsecureAllowKeyEviction]. It is read
 	// during construction only; nothing on the request path consults it.
 	allowEviction bool
+
+	// evictionCheck records what the construction-time check established, so
+	// that a skipped check is reportable rather than silent. Written once by
+	// [New] before the Store escapes; read-only afterwards.
+	evictionCheck EvictionCheck
+}
+
+// EvictionCheck reports what [New] was able to establish about the server's
+// eviction configuration.
+//
+// The eviction check is best-effort by design (see [Store.EvictionCheck]), and
+// every reason it can come back unestablished is a reason that is *more* likely
+// on managed Redis than on a local container. This type exists so that "the
+// store checks this for you" can be turned into a question with an answer,
+// rather than an assumption.
+type EvictionCheck int
+
+const (
+	// EvictionCheckUnknown is the zero value, and asserts nothing. A Store
+	// returned by [New] never carries it; a zero-value Store is not usable.
+	EvictionCheckUnknown EvictionCheck = iota
+
+	// EvictionCheckVerified means every server reached reported a configuration
+	// under which it will not evict: either no memory ceiling, or
+	// maxmemory-policy noeviction.
+	//
+	// It is a statement about the moment the Store was built, not a standing
+	// guarantee. See [Store.EvictionCheck].
+	EvictionCheckVerified
+
+	// EvictionCheckNoConfigSupport means the client value passed to [New] does
+	// not expose CONFIG GET at all, so nothing was asked. A test double or a
+	// custom redis.Scripter implementation lands here.
+	EvictionCheckNoConfigSupport
+
+	// EvictionCheckReplyNotUnderstood means the server answered, but the reply
+	// did not carry a usable maxmemory or maxmemory-policy value.
+	EvictionCheckReplyNotUnderstood
+
+	// EvictionCheckServerSilent means CONFIG GET returned an error: the command
+	// is disabled or renamed — the normal case on ElastiCache, MemoryDB, Upstash
+	// and Azure Cache — or the server was not reachable when [New] ran.
+	//
+	// This is the common outcome in production and the rare one in local
+	// development, which is the inversion worth knowing about: the check is
+	// loudest where the stakes are lowest.
+	EvictionCheckServerSilent
+
+	// EvictionCheckOptedOut means [InsecureAllowKeyEviction] was passed, so no
+	// check was attempted and no round trip was made.
+	EvictionCheckOptedOut
+)
+
+// Verified reports whether the check positively established a safe
+// configuration. Every other value means the check was skipped, not that it
+// passed.
+func (c EvictionCheck) Verified() bool { return c == EvictionCheckVerified }
+
+// String implements [fmt.Stringer].
+func (c EvictionCheck) String() string {
+	switch c {
+	case EvictionCheckVerified:
+		return "verified: no eviction configured"
+	case EvictionCheckNoConfigSupport:
+		return "skipped: the client cannot issue CONFIG GET"
+	case EvictionCheckReplyNotUnderstood:
+		return "skipped: the server's CONFIG reply was not understood"
+	case EvictionCheckServerSilent:
+		return "skipped: CONFIG is disabled, renamed, or the server was unreachable"
+	case EvictionCheckOptedOut:
+		return "skipped: InsecureAllowKeyEviction was passed"
+	default:
+		return "unknown: no check was performed"
+	}
 }
 
 // Option configures a [Store].
@@ -232,11 +306,52 @@ func New(client redis.Scripter, opts ...Option) (*Store, error) {
 			opt(s)
 		}
 	}
-	if err := s.checkEvictionPolicy(); err != nil {
+	check, err := s.checkEvictionPolicy()
+	if err != nil {
 		return nil, err
 	}
+	s.evictionCheck = check
 	return s, nil
 }
+
+// EvictionCheck reports what the construction-time eviction check established.
+//
+// [New] refuses to build a Store against a server it can see is configured to
+// evict keys, because eviction silently resets rate limits (see
+// [ErrUnsafeEvictionPolicy]). What it cannot do is establish the answer
+// everywhere, and when it cannot, it proceeds. That is the right trade — a
+// library that guessed would reject working deployments it cannot inspect — but
+// it means a Store built without error is not the same thing as a Store built
+// against a server known to be safe.
+//
+// This method is the difference, made available rather than left implicit:
+//
+//	store, err := redisstore.New(client)
+//	if err != nil {
+//		return err
+//	}
+//	if c := store.EvictionCheck(); !c.Verified() {
+//		log.Printf("redisstore: eviction policy unverified (%s); confirm maxmemory-policy is noeviction", c)
+//	}
+//
+// Two gaps it will not close, both worth knowing before relying on a verified
+// result:
+//
+//   - A verified result is a snapshot. It describes the server's mutable runtime
+//     state at construction. `CONFIG SET maxmemory-policy allkeys-lru` is one
+//     command away, and the moment it is most likely to be run is a memory
+//     incident — exactly when the bypass matters. Nothing re-checks afterwards.
+//
+//   - In cluster or ring mode, every master reachable at construction is asked,
+//     and only then. A node that joins later, or a replica promoted by failover
+//     with a different configuration, is not covered. Failover is also a thing
+//     that happens during memory incidents.
+//
+// The honest summary is that this check closes the case of an operator who never
+// knew, and does not make a deployment permanently safe. An operator who needs
+// the stronger property should assert `maxmemory-policy noeviction` from
+// configuration management, where it is an invariant rather than an observation.
+func (s *Store) EvictionCheck() EvictionCheck { return s.evictionCheck }
 
 // checkEvictionPolicy asks the server whether it is configured to evict keys,
 // and refuses to build a Store if it positively determines that it is.
@@ -268,44 +383,53 @@ func New(client redis.Scripter, opts ...Option) (*Store, error) {
 // It costs one round trip at construction, bounded by the store's timeout. New
 // still does not fail because Redis is down — an unreachable server is a case
 // the check cannot establish, so it is skipped.
-func (s *Store) checkEvictionPolicy() error {
+//
+// The returned [EvictionCheck] records which of those it was, so that a skipped
+// check is reportable through [Store.EvictionCheck] rather than indistinguishable
+// from a passing one.
+func (s *Store) checkEvictionPolicy() (EvictionCheck, error) {
 	if s.allowEviction {
-		return nil
+		return EvictionCheckOptedOut, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
 	// A cluster or a ring answers per node, and a single node's configuration
 	// says nothing about its peers, so every reachable one is asked.
+	// A multi-node sweep is only as good as its weakest node, so the reported
+	// outcome is the least-established one seen. EvictionCheck's constants are
+	// ordered from most to least established for exactly this.
+	sweep := func(each func(context.Context, func(context.Context, *redis.Client) error) error) (EvictionCheck, error) {
+		worst := EvictionCheckVerified
+		var unsafe error
+		// A per-node transport failure must not abort the sweep, so the closure
+		// only ever returns nil and the verdict is carried out separately.
+		_ = each(ctx, func(ctx context.Context, node *redis.Client) error {
+			check, err := evictionPolicyOf(ctx, node)
+			if check > worst {
+				worst = check
+			}
+			if err != nil && unsafe == nil {
+				unsafe = err
+			}
+			return nil
+		})
+		return worst, unsafe
+	}
+
 	switch c := s.client.(type) {
 	case interface {
 		ForEachMaster(context.Context, func(context.Context, *redis.Client) error) error
 	}:
-		var unsafe error
-		// A per-node transport failure must not abort the sweep, so the closure
-		// only ever returns nil and the verdict is carried out separately.
-		_ = c.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
-			if err := evictionPolicyOf(ctx, node); err != nil && unsafe == nil {
-				unsafe = err
-			}
-			return nil
-		})
-		return unsafe
+		return sweep(c.ForEachMaster)
 	case interface {
 		ForEachShard(context.Context, func(context.Context, *redis.Client) error) error
 	}:
-		var unsafe error
-		_ = c.ForEachShard(ctx, func(ctx context.Context, node *redis.Client) error {
-			if err := evictionPolicyOf(ctx, node); err != nil && unsafe == nil {
-				unsafe = err
-			}
-			return nil
-		})
-		return unsafe
+		return sweep(c.ForEachShard)
 	case configReader:
 		return evictionPolicyOf(ctx, c)
 	}
-	return nil
+	return EvictionCheckNoConfigSupport, nil
 }
 
 // configReader is the sliver of a go-redis client needed to read server
@@ -317,35 +441,52 @@ type configReader interface {
 }
 
 // evictionPolicyOf returns [ErrUnsafeEvictionPolicy] when one server is known to
-// evict, and nil in every case where that cannot be established.
-func evictionPolicyOf(ctx context.Context, c configReader) error {
+// evict, and a nil error in every case where that cannot be established.
+//
+// The [EvictionCheck] it returns alongside distinguishes "this server reported a
+// safe configuration" from "this server did not tell us" — a distinction the
+// error return cannot carry, since both are a nil error.
+func evictionPolicyOf(ctx context.Context, c configReader) (EvictionCheck, error) {
 	// One glob rather than two parameters: CONFIG GET took a single parameter
 	// until Redis 7, and both values are needed together anyway.
 	cfg, err := c.ConfigGet(ctx, "maxmemory*").Result()
 	if err != nil {
-		return nil // CONFIG is unavailable; the library genuinely cannot know.
+		// CONFIG is disabled, renamed, or the server is not reachable. The
+		// library genuinely cannot know, and cannot tell those apart either:
+		// managed Redis reports a disabled command as an ordinary error.
+		return EvictionCheckServerSilent, nil
 	}
 
 	// Without a memory ceiling Redis never evicts, whatever the policy says, so
-	// a non-default policy on an uncapped server is not a finding.
+	// a non-default policy on an uncapped server is not a finding. A server that
+	// reports no ceiling at all has answered the question, so this is verified
+	// rather than skipped.
 	limit, ok := cfg["maxmemory"]
 	if !ok {
-		return nil
+		return EvictionCheckReplyNotUnderstood, nil
 	}
-	if bytes, convErr := strconv.ParseInt(strings.TrimSpace(limit), 10, 64); convErr != nil || bytes == 0 {
-		return nil
+	bytes, convErr := strconv.ParseInt(strings.TrimSpace(limit), 10, 64)
+	if convErr != nil {
+		return EvictionCheckReplyNotUnderstood, nil
+	}
+	if bytes == 0 {
+		return EvictionCheckVerified, nil
 	}
 
 	policy, ok := cfg["maxmemory-policy"]
 	if !ok {
-		return nil
+		return EvictionCheckReplyNotUnderstood, nil
 	}
 	// Compared case-folded, but reported verbatim: an operator matching the
 	// error against their own config file wants the string the server gave.
-	if normalized := strings.ToLower(strings.TrimSpace(policy)); normalized == "" || normalized == "noeviction" {
-		return nil
+	normalized := strings.ToLower(strings.TrimSpace(policy))
+	if normalized == "" {
+		return EvictionCheckReplyNotUnderstood, nil
 	}
-	return fmt.Errorf("%w (server reports maxmemory-policy %q with maxmemory set)", ErrUnsafeEvictionPolicy, policy)
+	if normalized == "noeviction" {
+		return EvictionCheckVerified, nil
+	}
+	return EvictionCheckVerified, fmt.Errorf("%w (server reports maxmemory-policy %q with maxmemory set)", ErrUnsafeEvictionPolicy, policy)
 }
 
 // InsecureAllowKeyEviction lets [New] build a Store against a Redis server that

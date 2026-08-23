@@ -62,21 +62,34 @@ func TestNewRejectsAnEvictingServer(t *testing.T) {
 // TestNewAcceptsASafeServer is the false-positive guard: the check must cost
 // nothing to a correctly configured deployment, and must not fire on a server
 // that has no memory ceiling at all, where the policy is inert whatever it says.
+//
+// The want column is the second half of the point, and the reason this table is
+// not five nil-error assertions: three of these rows construct a Store without
+// establishing anything. "No error from New" and "this server was checked and is
+// safe" are different outcomes, and only the first two rows are the second one.
 func TestNewAcceptsASafeServer(t *testing.T) {
 	tests := []struct {
 		name   string
 		config map[string]string
+		want   EvictionCheck
 	}{
-		{"noeviction with a ceiling", map[string]string{"maxmemory": "1073741824", "maxmemory-policy": "noeviction"}},
-		{"no ceiling, so the policy never fires", map[string]string{"maxmemory": "0", "maxmemory-policy": "allkeys-lru"}},
-		{"no ceiling reported at all", map[string]string{"maxmemory-policy": "allkeys-lru"}},
-		{"no policy reported", map[string]string{"maxmemory": "1073741824"}},
-		{"an unparsable ceiling is not a verdict", map[string]string{"maxmemory": "lots", "maxmemory-policy": "allkeys-lru"}},
+		{"noeviction with a ceiling", map[string]string{"maxmemory": "1073741824", "maxmemory-policy": "noeviction"}, EvictionCheckVerified},
+		{"no ceiling, so the policy never fires", map[string]string{"maxmemory": "0", "maxmemory-policy": "allkeys-lru"}, EvictionCheckVerified},
+		{"no ceiling reported at all", map[string]string{"maxmemory-policy": "allkeys-lru"}, EvictionCheckReplyNotUnderstood},
+		{"no policy reported", map[string]string{"maxmemory": "1073741824"}, EvictionCheckReplyNotUnderstood},
+		{"an unparsable ceiling is not a verdict", map[string]string{"maxmemory": "lots", "maxmemory-policy": "allkeys-lru"}, EvictionCheckReplyNotUnderstood},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := New(&configuredScripter{config: tc.config}); err != nil {
-				t.Errorf("New = %v, want no error", err)
+			s, err := New(&configuredScripter{config: tc.config})
+			if err != nil {
+				t.Fatalf("New = %v, want no error", err)
+			}
+			if got := s.EvictionCheck(); got != tc.want {
+				t.Errorf("EvictionCheck() = %q (%d), want %q (%d)", got, got, tc.want, tc.want)
+			}
+			if got := s.EvictionCheck(); got.Verified() != (tc.want == EvictionCheckVerified) {
+				t.Errorf("Verified() = %v for %q", got.Verified(), got)
 			}
 		})
 	}
@@ -134,4 +147,106 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestEvictionCheckReportsWhyItWasSkipped is the regression test for the gap
+// this type was added to close.
+//
+// Before it, all three of these cases were indistinguishable from a server that
+// had been asked and had answered safely: New returned a Store and no error, and
+// nothing on the Store said otherwise. Two of them are the *normal* case on
+// managed Redis, where CONFIG is disabled — which is to say the check was
+// quietest exactly where deployments are largest.
+func TestEvictionCheckReportsWhyItWasSkipped(t *testing.T) {
+	t.Run("CONFIG is disabled or renamed", func(t *testing.T) {
+		c := &configuredScripter{err: errors.New("ERR unknown command 'CONFIG'")}
+		s, err := New(c)
+		if err != nil {
+			t.Fatalf("New = %v, want no error", err)
+		}
+		if got := s.EvictionCheck(); got != EvictionCheckServerSilent {
+			t.Errorf("EvictionCheck() = %q, want EvictionCheckServerSilent", got)
+		}
+	})
+
+	// An unreachable server is reported the same way, and deliberately so: a
+	// managed Redis returns a disabled command as an ordinary error, so the two
+	// are not distinguishable from here. What matters to the caller is the same
+	// in both cases — nothing was established.
+	t.Run("the server was unreachable", func(t *testing.T) {
+		c := &configuredScripter{err: errors.New("dial tcp 10.0.0.1:6379: i/o timeout")}
+		s, err := New(c)
+		if err != nil {
+			t.Fatalf("New = %v, want no error", err)
+		}
+		if got := s.EvictionCheck(); got != EvictionCheckServerSilent {
+			t.Errorf("EvictionCheck() = %q, want EvictionCheckServerSilent", got)
+		}
+	})
+
+	t.Run("the client cannot issue CONFIG", func(t *testing.T) {
+		s, err := New(&fakeScripter{})
+		if err != nil {
+			t.Fatalf("New = %v, want no error", err)
+		}
+		if got := s.EvictionCheck(); got != EvictionCheckNoConfigSupport {
+			t.Errorf("EvictionCheck() = %q, want EvictionCheckNoConfigSupport", got)
+		}
+	})
+
+	t.Run("the caller opted out", func(t *testing.T) {
+		c := &configuredScripter{config: map[string]string{
+			"maxmemory":        "1073741824",
+			"maxmemory-policy": "allkeys-lru",
+		}}
+		s, err := New(c, InsecureAllowKeyEviction())
+		if err != nil {
+			t.Fatalf("New = %v, want no error", err)
+		}
+		if got := s.EvictionCheck(); got != EvictionCheckOptedOut {
+			t.Errorf("EvictionCheck() = %q, want EvictionCheckOptedOut", got)
+		}
+	})
+}
+
+// TestEvictionCheckZeroValueAssertsNothing guards the direction of the enum.
+//
+// If EvictionCheckVerified were the zero value, a Store that had never been
+// through New — or a future field added ahead of the assignment — would claim a
+// guarantee by default. The safe answer has to be the one you get for free.
+func TestEvictionCheckZeroValueAssertsNothing(t *testing.T) {
+	var zero EvictionCheck
+	if zero.Verified() {
+		t.Error("the zero value of EvictionCheck reports Verified")
+	}
+	if zero != EvictionCheckUnknown {
+		t.Errorf("zero value = %d, want EvictionCheckUnknown", zero)
+	}
+	var s Store
+	if s.EvictionCheck().Verified() {
+		t.Error("a zero-value Store reports a verified eviction check")
+	}
+}
+
+// TestEvictionCheckStringIsActionable keeps the String values from decaying into
+// bare identifiers. They are meant to be logged verbatim by a caller who then
+// has to decide what to do, so each has to say whether the check happened.
+func TestEvictionCheckStringIsActionable(t *testing.T) {
+	for _, c := range []EvictionCheck{
+		EvictionCheckUnknown,
+		EvictionCheckVerified,
+		EvictionCheckNoConfigSupport,
+		EvictionCheckReplyNotUnderstood,
+		EvictionCheckServerSilent,
+		EvictionCheckOptedOut,
+	} {
+		got := c.String()
+		if got == "" {
+			t.Errorf("EvictionCheck(%d) has an empty String", c)
+			continue
+		}
+		if !contains(got, "verified") && !contains(got, "skipped") && !contains(got, "unknown") {
+			t.Errorf("EvictionCheck(%d).String() = %q: it does not say whether the check happened", c, got)
+		}
+	}
 }

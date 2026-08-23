@@ -36,9 +36,12 @@ env:
   GOSUMDB: sum.golang.org
 
 jobs:
-  # The submodules require github.com/JonasBorgesLM/moat at a version that
-  # is not tagged yet, so they are built through a workspace pointing at the
-  # working tree. Once v0.1.0 is tagged and pushed, the replace line can go.
+  # This job builds the satellites through a workspace, so they resolve the core
+  # against the working tree. That is what makes a change to the core visible to
+  # redisstore/ and examples/ without a tagged release for every commit -- and it
+  # is also, precisely, why this job CANNOT see a stale `require` on the core.
+  # Inside the workspace the require line is inert. See DESIGN.md §6.16, and the
+  # `released-satellites` job below, which is the one that checks it.
   #
   # go.work is not committed (see .gitignore): a committed workspace changes how
   # modules resolve for everyone who clones the repo.
@@ -50,9 +53,9 @@ jobs:
       matrix:
         module: [".", "redisstore", "examples"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: false
@@ -64,7 +67,6 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       - name: go build
         working-directory: ${{ matrix.module }}
@@ -83,11 +85,101 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
 
       - name: Upload coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.module == '.' && 'core' || matrix.module }}
           path: ${{ matrix.module }}/coverage.out
           if-no-files-found: warn
+
+  # Every other job in this file runs inside a go.work that lists all three
+  # modules under `use`, which makes the satellites resolve the core from the
+  # working tree and their `require` lines inert. redisstore/v0.2.0 shipped
+  # broken for exactly that reason (DESIGN.md §6.16): its require still named the
+  # core at v0.1.0, whose ratelimit.Store declares Take rather than TakeN, so the
+  # published module did not satisfy the interface it exists to implement. Every
+  # local signal was green, and necessarily so.
+  #
+  # This job is the one that would have been red. GOWORK=off means the satellites
+  # resolve the core from the module proxy at the version their go.mod actually
+  # names -- the same resolution a consumer gets, which is the only resolution
+  # that can catch a stale pin.
+  #
+  # There is a chicken-and-egg case, and it is handled by release ORDER, not by
+  # weakening this job: tag the core first, then bump the satellite's require,
+  # then let this job go green, then tag the satellite. Done in that order there
+  # is no window, because the core version the satellite names is already
+  # published when the bump is committed. See CONTRIBUTING.md, "Release order".
+  #
+  # A PR that must change a core API and its satellite consumers in one go is the
+  # one case where red here is expected. Label it `cross-module-window` to skip,
+  # deliberately and visibly, in the same spirit as
+  # redisstore.InsecureAllowKeyEviction: the default is to fail, and the bypass
+  # has to be spelled out by a human and is visible on the PR.
+  released-satellites:
+    name: satellite resolves the published core (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.pull_request.labels.*.name, 'cross-module-window')"
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ["redisstore", "examples"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          check-latest: false
+
+      # No `go work init` step anywhere in this job. That omission is the whole
+      # point of it, so do not add one to "make it consistent" with the others.
+      - name: Confirm no workspace is in effect
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: |
+          # `go env GOWORK` prints "off" when disabled and the path to the
+          # workspace file when one is in effect -- it is not empty in the
+          # disabled case. Compare against "off" rather than testing for
+          # emptiness, which reads correct and is not.
+          gowork="$(go env GOWORK)"
+          if [ "$gowork" != "off" ]; then
+            echo "::error::a workspace is in effect ($gowork); this job proves nothing"
+            exit 1
+          fi
+          echo "resolving github.com/JonasBorgesLM/moat at:"
+          go list -m github.com/JonasBorgesLM/moat
+
+      # Verifies that what the proxy serves matches the recorded hashes. A module
+      # whose go.sum has no entry for a dependency it declares has never been
+      # resolved outside a workspace at all -- which was true of both satellites
+      # until e7c8801.
+      - name: go mod verify
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go mod verify
+
+      # -mod=readonly (set globally above) makes this fail rather than silently
+      # rewrite go.mod if the require is inconsistent with what the code needs.
+      - name: go build
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go build ./...
+
+      - name: go vet
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go vet ./...
+
+      # The unit suites only. The integration tags need Docker and are covered by
+      # the `integration` job; what is being proved here is version resolution.
+      - name: go test
+        working-directory: ${{ matrix.module }}
+        env:
+          GOWORK: "off"
+        run: go test ./...
 
   # The zero-dependency claim is the core module's most load-bearing promise, so
   # it is asserted mechanically rather than trusted.
@@ -95,8 +187,8 @@ jobs:
     name: core module has no dependencies
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: false
@@ -132,8 +224,8 @@ jobs:
       matrix:
         module: [".", "redisstore", "examples"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: false
@@ -141,7 +233,6 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       - name: gofmt
         working-directory: ${{ matrix.module }}
@@ -178,8 +269,8 @@ jobs:
       matrix:
         module: [".", "redisstore", "examples"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: false
@@ -187,7 +278,6 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       - name: Install govulncheck ${{ env.GOVULNCHECK_VERSION }}
         run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
@@ -203,8 +293,8 @@ jobs:
     name: short fuzz run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: false
@@ -228,7 +318,7 @@ jobs:
       # the runner. Keeping it means the failing input can be added as a seed.
       - name: Upload any crashers
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashers
           path: "**/testdata/fuzz/**"
@@ -238,8 +328,8 @@ jobs:
     name: integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: false
@@ -247,7 +337,6 @@ jobs:
       - name: Create the development workspace
         run: |
           go work init . ./redisstore ./examples
-          go work edit -replace github.com/JonasBorgesLM/moat@v0.1.0=./
 
       # Suite A: the whole chain over a real TLS server with a real cookie jar.
       # Standard library only, no infrastructure.
@@ -272,9 +361,9 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           # A new dependency in this repository is a design decision, so
           # anything with a known vulnerability at any severity fails the build

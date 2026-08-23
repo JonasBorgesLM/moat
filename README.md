@@ -77,9 +77,17 @@ The core module requires **Go 1.24+** — the floor set by `os.Root`, which
 `pathguard` is built on and which landed in 1.24. The core has no external
 dependencies, so nothing pushes it higher.
 
-The `redisstore` module declares **Go 1.25**, forced there by its own
-dependencies (`testcontainers-go` requires 1.25); `examples/` likewise, via
-`gin`. Neither floor affects you unless you import those modules.
+The `redisstore` module declares **Go 1.26.6**, and that one is a security floor
+rather than a dependency floor: it reaches `crypto/tls` and `encoding/asn1`,
+which carry [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090) and
+[GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972), fixed in 1.25.13 and
+1.26.6. It is declared in the `go` directive rather than `toolchain`, because a
+`toolchain` line in a dependency is ignored by whoever imports it — see
+[`redisstore/README.md`](./redisstore/README.md) for why 1.25.13 would not have
+done the job. `examples/` declares 1.25, forced there by `gin`.
+
+Neither floor affects you unless you import those modules. The core is unchanged
+at 1.24.
 
 ## Packages
 
@@ -95,7 +103,7 @@ dependencies (`testcontainers-go` requires 1.25); `examples/` likewise, via
 | `pathguard` | Traversal- and TOCTOU-safe file resolution and serving |
 | `realip` | Client IP behind trusted proxies, parsed right-to-left |
 | `secret` | `Value` — bytes that cannot be printed, logged or marshalled by accident |
-| `redisstore` *(separate module)* | Redis-backed `ratelimit.Store`, atomic via Lua |
+| [`redisstore`](./redisstore/README.md) *(separate module)* | Redis-backed `ratelimit.Store`, atomic via Lua |
 
 Every package is independently importable — take only what you need.
 
