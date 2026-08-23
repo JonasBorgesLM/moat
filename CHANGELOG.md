@@ -210,7 +210,7 @@ Initial release.
 Requires the core module. Which version of it, per release, is in
 `redisstore/README.md`; the numbers on the two modules do not track each other.
 
-## Unreleased (redisstore/v0.2.2)
+## redisstore/v0.2.2
 
 ### Requirements — action may be needed
 
