@@ -326,7 +326,8 @@ shipped `redisstore/v0.2.0` broken (DESIGN.md §6.16), and it is the reason the
 
 Releasing the core and a satellite together:
 
-1. **Tag and push the core** (`v0.3.0`). Nothing about the satellites yet.
+1. **Tag and push the core** (`v0.3.0`), annotated and signed, with a real
+   message — see "Tags are signed" below.
 2. **Bump the satellite's `require`** on the core to that version, in its own
    commit, and run `go mod tidy` in the satellite directory with `GOWORK=off` —
    `tidy` ignores `go.work`, but `GOWORK=off` also makes `go list`/`go build`
@@ -334,9 +335,47 @@ Releasing the core and a satellite together:
 3. **Wait for `released-satellites` to go green** on that commit. It resolves
    the satellite against the proxy at the version its `go.mod` names, which is
    the only check in the pipeline that exercises cross-module resolution at all.
-4. **Tag and push the satellite** (`redisstore/v0.3.0`).
+4. **Tag and push the satellite** (`redisstore/v0.3.0`), same conditions as
+   step 1.
 5. **Clean-room fetch** both from the proxy, into a directory outside the repo,
    and run real code against them.
+6. **Publish a GitHub Release** for each new tag, with the module's section of
+   `CHANGELOG.md` in the body. The release body is GitHub metadata and stays
+   editable after the fact; the tag message does not.
+
+### Tags are signed
+
+Release tags are **annotated and signed**, using SSH signing with the
+maintainer's ed25519 key registered on GitHub as a signing key:
+
+```sh
+git config gpg.format ssh
+git config user.signingkey ~/.ssh/id_ed25519.pub
+git config tag.gpgsign true
+```
+
+With `tag.gpgsign` on, `git tag -a` signs without being asked. Verify before
+pushing — a signature nobody checks is decoration:
+
+```sh
+git tag -v redisstore/v0.3.0     # wants: Good "git" signature ...
+```
+
+`git tag -v` needs `gpg.ssh.allowedSignersFile` pointing at a file mapping the
+signing identity to its public key, or it will report the signature as being
+from an unknown key. GitHub shows a **Verified** badge on the tag independently
+of that local setting.
+
+**Write a real tag message.** It is the one part of a release that cannot be
+corrected afterwards: once the module proxy has fetched a version, the tag is
+immutable in practice, and deleting or moving it makes the proxy serve something
+the repository no longer shows — strictly worse than the original mistake. A
+placeholder in a tag message is permanent. `redisstore/v0.2.2` shipped with a
+literal `...` as its message and unsigned, and both are now uncorrectable for
+that version; the notes live in its GitHub Release instead.
+
+Tags already published are never re-signed or moved, for the same reason. The
+policy applies from the next tag forward.
 
 Done in that order there is no window where CI is legitimately red: the core
 version the satellite names is already published at the moment the bump is

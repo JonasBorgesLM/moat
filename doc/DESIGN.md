@@ -1951,6 +1951,22 @@ This is not an argument against outside review. R6 produced §6.0, which is the
 most valuable structural change this project has made. It is an argument for the
 order: verify the premise, then act on the finding. Both, in that sequence.
 
+A second instance followed almost immediately, and is recorded because one
+occurrence is an anecdote. A follow-up instruction stated that `DESIGN.md` and
+`CONTRIBUTING.md` "record that tag signing is pending for want of a key" and
+asked for that wording to be corrected, since a key now existed. Neither file
+said anything of the kind — `grep -rn -i 'gpgsign\|sign.*tag'` across the
+repository returns nothing. The limitation had been reported in conversation and
+never written down.
+
+The instruction was still worth acting on, but not as written: there was no
+wording to correct, so the signing policy was **added** rather than edited. Had
+the premise been taken at face value, the likely outcome was searching for absent
+text and then inventing a passage to "fix" — a plausible-looking edit with no
+prior version behind it. The pattern is the same as the one above and the check
+is the same one command; the difference is only that this time the false premise
+was about documentation rather than about branches.
+
 #### Round summary
 
 | # | Claim | Verdict |
@@ -2010,6 +2026,26 @@ are the mechanisms working rather than failing:
   something already published. That is the argument for having had them on, and
   it belongs in the log rather than in a commit message nobody re-reads.
 
+- **The `v0.2.2` tag went out with a placeholder message and no signature.** Its
+  annotation is a literal `...`, from a command sketched in conversation and run
+  as written. Signing was genuinely unavailable at the time; the placeholder was
+  not, and nothing in the release checklist looked at the tag message before the
+  push.
+
+  It is uncorrectable. `proxy.golang.org` had already cached `v0.2.2` pinned to
+  commit `8078d42`, so the tag is immutable in practice and re-cutting it would
+  put the repository and the proxy permanently out of step — the §6.16 mistake in
+  a new place. The real notes went into the GitHub Release body, which is
+  metadata and stays editable, and `CONTRIBUTING.md` now makes both the message
+  and the signature explicit steps with a `git tag -v` before the push. §8 records
+  why published tags are never re-signed.
+
+  Worth naming as its own small class: **the parts of a release that cannot be
+  fixed afterwards deserve the checklist attention, and they are not the parts
+  that get it.** Code, docs and release notes are all correctable after
+  publication. The tag message and the tag's signature are not, and they were the
+  two things nothing checked.
+
 ---
 
 ## 7. Testing strategy
@@ -2061,6 +2097,31 @@ CI runs, per module: `go vet`, `staticcheck`, `gosec`, `go build`,
   than a preference: tag the core, bump the satellite's `require`, wait for the
   `released-satellites` job, then tag the satellite. Doing it in another order is
   what produced §6.16.
+
+- **Tags are annotated and signed**, from `v0.2.2` forward — SSH signing with an
+  ed25519 key registered on GitHub as a signing key, `tag.gpgsign` enabled so
+  that `git tag -a` signs without being asked, and `git tag -v` run before the
+  push. For a library whose value proposition is that its supply chain is small
+  and inspectable, an unsigned release tag is a gap in the same argument: it is
+  the artifact a consumer resolves, and nothing else in the chain attests to who
+  produced it.
+
+  Two limits on what that buys, stated so the guarantee is not read wider than it
+  is. It attests to the tag, not to the module zip the proxy serves — the
+  checksum database is what covers that, and it covers it better. And it says a
+  particular key signed a particular commit; it does not say the code is correct,
+  which is what the rest of this document is for.
+
+- **Tags already published are never moved, deleted, or re-signed.** Once the
+  module proxy has fetched a version it is immutable in practice, and a tag whose
+  content differs from what the proxy serves is strictly worse than whatever the
+  original mistake was. The instrument for a bad release is always `retract` plus
+  a new version (§6.16), and the instrument for bad *notes* is the GitHub
+  Release body, which stays editable. This is why `redisstore/v0.2.2` still
+  carries a literal `...` as its tag message and no signature: the placeholder
+  was noticed after the proxy had already cached the version, at which point the
+  cost of fixing it exceeds the cost of leaving it and writing the real notes
+  where they can still be written.
 - **`v0.1.0` (core) and `redisstore/v0.1.0` were tagged on the commit that
   closes §6.11** — after the rename to `moat`, after the `preset.API`
   ordering fix, and after both self-found bugs were verified and swept for
