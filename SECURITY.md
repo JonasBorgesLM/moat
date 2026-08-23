@@ -34,6 +34,40 @@ minor versions, upgrading is the fix.
 `doc/DESIGN.md` §6.16. `go get` will not select it, but a `go.mod` that pins it
 explicitly still needs changing.
 
+### Known advisories in released versions
+
+| Affects | Advisory | Status |
+|---|---|---|
+| `redisstore` ≤ `v0.2.1` | [GHSA-hfg8-hc9c-6c3h](https://github.com/advisories/GHSA-hfg8-hc9c-6c3h) / CVE-2026-17106 (high) — `moby/go-archive < 0.3.0`, crafted tar writes outside the extraction directory | Fixed in `redisstore/v0.2.2`. **Not exploitable through this module**; see below |
+| core, all versions | none | — |
+
+The `go-archive` advisory needs its scope stated precisely, because "high
+severity in your dependency tree" and "your application is vulnerable" are not
+the same claim and this library should not blur them.
+
+`go-archive` arrives through `testcontainers-go`, which `redisstore` uses only in
+its integration suite. Measured against the published `v0.2.1` tag from a clean
+directory outside the repository: the module appears in a consumer's `go.sum`
+(both hashes) and in `go list -m all`, but **none of its packages enter the build**
+(`go list -deps` finds nothing), and `govulncheck` on such a consumer reports *No
+vulnerabilities found*. There is no path from `redisstore`'s API to a tar
+extraction. No binary built against `v0.2.1` contains the vulnerable code.
+
+What it does do is put a **high** finding into the dependency scanner of every
+project that depends on `redisstore/v0.2.1` — Dependabot, Snyk and
+`dependency-review-action` read the module graph, not the reachability analysis —
+and that finding cannot be cleared downstream, because the requirement is in this
+project's `go.mod`. Handing that to downstream users is a real cost even with no
+runtime impact.
+
+`v0.2.1` is therefore **superseded but not retracted**: it compiles, runs, and is
+not exploitable, so a retraction would be the wrong instrument. Upgrade to
+`redisstore/v0.2.2` to clear the alert.
+
+Dependabot alerts and automated security updates are enabled on the repository.
+They were not enabled before August 2026, which is how a high advisory reached a
+published tag; this one was reported within minutes of turning them on.
+
 ### Required Go toolchain
 
 The toolchain a consumer builds with is part of this library's security posture,

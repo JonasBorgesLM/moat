@@ -1911,6 +1911,46 @@ floor moving to the `go` directive, the compatibility table, the `realip`
 examples, the split changelog — all stands on its own and is recorded in the
 sections it belongs to.
 
+#### The process finding: verify before you execute
+
+This one is about the review process, not about the code, and it is the entry
+this log is most useful for preserving.
+
+The plan built on that review was staged: reconciliation first, everything else
+blocked behind it, on the reasoning that there is no point fixing CI in a
+repository whose branch state is unknown. As sequencing that is sound. The
+problem is what the first stage instructed — *bring the v0.2.0 work back to
+`main`*, and make `main`'s content "equal to or later than" the tag.
+
+Executed as written against a `main` that already contained all of it, that
+instruction is not a no-op. It is a request to reconstruct files that are already
+present, from a source believed to be authoritative and in fact stale, on a
+branch that was correct before the operation started. The most likely outcomes
+are a merge conflict against reality or a commit that reverts good work while
+looking like a restoration. The cost of the unverified premise was not the wasted
+effort of the check — it was avoiding a destructive change to a correct branch.
+
+What prevented it was running the diagnostic stage as a diagnostic: `git
+merge-base --is-ancestor` over every tag, `git ls-tree` over the files claimed
+missing, and reading the README rather than accepting a quoted line from it. Five
+commands. The plan asked for exactly this and explicitly forbade changes in that
+stage — so the safeguard was in the plan, and it worked.
+
+The generalisable form, which applies to any report about state rather than about
+behaviour:
+
+**A claim about repository state is checkable in one command. A report that
+asserts one without showing the command has produced a hypothesis, not a
+finding — and a remediation plan built on an unverified hypothesis is capable of
+destroying the thing it was written to protect.** Where a plan's first step is
+"reconcile", "restore", or "bring back", the premise deserves more scepticism
+than the proposed fix, not less: fixes that add are recoverable, and fixes that
+restore overwrite.
+
+This is not an argument against outside review. R6 produced §6.0, which is the
+most valuable structural change this project has made. It is an argument for the
+order: verify the premise, then act on the finding. Both, in that sequence.
+
 #### Round summary
 
 | # | Claim | Verdict |
@@ -1925,6 +1965,50 @@ sections it belongs to.
 | 8 | The eviction check is silent exactly where it matters | **Confirmed.** `Store.EvictionCheck` added |
 | 9 | Versions have drifted, so a compatibility table is needed | **Confirmed.** Added; §8 corrected |
 | 10 | `realip` has no examples | **Confirmed.** Three added |
+
+#### What the round shipped, and two things it found on the way out
+
+`redisstore/v0.2.2` was tagged following the release order §6.16 now specifies —
+the core needed no new tag, since it gained only examples and documentation and
+`v0.2.2` still requires it at the already-published `v0.2.0`. Verified from a
+clean directory outside the repository, resolving through the proxy: `*Store`
+satisfies `ratelimit.Store`, `EvictionCheck()` reports `verified: no eviction
+configured` against a `noeviction` server and `New` refuses an `allkeys-lru` one,
+and a burst of 3 over real Redis returns `[204 204 204 429 429]` with a second
+client getting its own bucket. A separate consumer importing all ten core
+packages builds and runs on **go1.24.0**, producing a two-line `go.sum` — the
+zero-dependency claim, checked on the declared floor rather than on the
+maintainer's toolchain.
+
+Two things surfaced during the release itself, both worth recording because both
+are the mechanisms working rather than failing:
+
+- **The guard's own condition was wrong.** `released-satellites` asserts that no
+  workspace is active before it proves anything, and it did so with
+  `[ -n "$(go env GOWORK)" ]`. But `go env GOWORK` prints `off` when disabled and
+  the workspace path when active — it is never empty, so the job failed on both
+  satellites on its first run. It failed *closed*, which is the direction a guard
+  should be wrong in, and it was caught by the job running rather than by review.
+  The check that exists to stop this job passing for the wrong reason was itself
+  the thing being checked. Fixed to compare against `off`.
+
+- **Enabling Dependabot alerts produced a high advisory within minutes.**
+  CVE-2026-17106 in `moby/go-archive < 0.3.0`, reaching `redisstore`
+  transitively through `testcontainers-go`. Scoped by measurement rather than
+  argument: it is in a consumer's `go.sum` and module graph, **not** in their
+  build (`go list -deps` finds nothing), and `govulncheck` on a `v0.2.1` consumer
+  reports nothing. So not runtime exposure — but every consumer of `v0.2.1`
+  inherits a high finding in their own scanner that they cannot clear, because
+  the requirement is in this project's `go.mod`. Bumped for `v0.2.2`; `v0.2.1` is
+  superseded, not retracted, since it compiles and is not exploitable and a
+  retraction would be the wrong instrument. Recorded in `SECURITY.md` rather than
+  fixed quietly, because "not exploitable" and "no cost to you" are different
+  claims and a security library should not blur them.
+
+  The uncomfortable part is the timeline: the repository ran without alerts from
+  its first commit until this round, and the first thing they did was find
+  something already published. That is the argument for having had them on, and
+  it belongs in the log rather than in a commit message nobody re-reads.
 
 ---
 

@@ -265,17 +265,40 @@ Requires the core module. Which version of it, per release, is in
 
 ### Fixed — security
 
-- `github.com/moby/go-archive` bumped `v0.2.0` → `v0.3.0` for
+- **`github.com/moby/go-archive` bumped `v0.2.0` → `v0.3.0`** for
   [GHSA-hfg8-hc9c-6c3h](https://github.com/advisories/GHSA-hfg8-hc9c-6c3h)
-  (CVE-2026-17106, high): a crafted tar archive can write outside the extraction
-  directory. It arrives transitively through `testcontainers-go` and is reachable
-  only from the integration suite, never from a consumer's build — `govulncheck`
-  reports it as uncalled — but a path-traversal advisory sitting unactioned in a
-  library that ships `pathguard` is not a good look, and the fix is a version
-  bump.
+  (CVE-2026-17106, **high**): a crafted tar archive can write outside the
+  extraction directory. It reaches this module transitively through
+  `testcontainers-go`, which is used only by the integration suite.
 
-  Found by Dependabot alerts within minutes of enabling them, which is the
-  argument for having had them on.
+  **`redisstore/v0.2.1` and earlier carry the vulnerable version.** What that
+  does and does not mean for you, measured against the published tag from a
+  clean directory rather than reasoned about:
+
+  | Question | v0.2.1 consumer |
+  |---|---|
+  | Is `go-archive` in your `go.sum`? | **Yes** — both the `h1:` and `/go.mod` hashes |
+  | Is it in your module graph (`go list -m all`)? | **Yes** |
+  | Is any of its code in your build (`go list -deps`)? | **No** |
+  | Does `govulncheck` report it? | **No — "No vulnerabilities found"** |
+
+  So this is **not** runtime exposure: the vulnerable code is never compiled into
+  a consumer's binary, and there is no attack path through `redisstore` to a tar
+  extraction. It is real anyway for a different reason. Dependency scanners —
+  Dependabot, Snyk, `dependency-review-action` with `fail-on-severity` — read the
+  module graph, not the reachability analysis. Every consumer of `v0.2.1`
+  therefore inherits a **high** alert on their own repository that they cannot
+  clear without upgrading, because the requirement lives in *our* `go.mod`.
+
+  Handing downstream projects an unactionable high alert is a real cost even when
+  no binary is affected, and a path-traversal advisory sitting unactioned in a
+  library that ships `pathguard` is not a defensible look. **Upgrade to
+  `redisstore/v0.2.2`.** No retract: `v0.2.1` compiles, runs, and is not
+  exploitable — retracting it would be the wrong instrument.
+
+  Found by Dependabot alerts within minutes of enabling them, on a repository
+  that had been running without them since its first commit. That is the argument
+  for having had them on, and it is recorded here rather than quietly fixed.
 
 ## redisstore/v0.2.1
 
@@ -297,6 +320,12 @@ into a clean directory outside the repository and running real code against it.
 
 v0.2.1 requires the core at `v0.2.0` and carries a `retract v0.2.0` directive.
 The core module's own `v0.2.0` tag is unaffected and needs no reissue.
+
+> **Superseded.** This version requires `github.com/moby/go-archive v0.2.0`,
+> which carries CVE-2026-17106 (high). It is not exploitable through this module
+> and `govulncheck` reports nothing, but it will raise a high alert in your own
+> dependency scanner. See the `redisstore/v0.2.2` entry above; upgrading is the
+> only way to clear it.
 
 ## redisstore/v0.1.0
 
