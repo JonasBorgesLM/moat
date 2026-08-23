@@ -9,38 +9,38 @@ change to upgrade.
 This project is pre-1.0. Breaking changes may occur in a minor release, which is
 what v0 signals — see `doc/DESIGN.md` §8.
 
+The two modules are tagged independently and their versions have already
+diverged, so this file is split by module rather than kept as one timeline. A
+`redisstore` entry and a core entry that sit next to each other are not
+necessarily related, and reading them as one sequence is how a reader concludes
+that `redisstore/v0.2.1` supersedes the core's `v0.2.0`. It does not; it requires
+it. The mapping lives in `redisstore/README.md`.
+
+---
+
+# Core — `github.com/JonasBorgesLM/moat`
+
 ## Unreleased
 
+- `realip` gains three runnable examples (`ExampleNew`,
+  `ExampleExtractor_KeyFunc`, `ExampleNew_viaPreset`). It was the package with no
+  indexed example on pkg.go.dev, which is a poor place for that gap given it is
+  the answer to the shared-bucket rate-limit finding.
 - Example code no longer names a local variable after an imported package
   (`examples/basic`). Added to the review checklist in `CONTRIBUTING.md`.
 - Private vulnerability reporting enabled on the repository, so the channel
   `SECURITY.md` documents is actually usable by a third-party reporter.
-
-## redisstore/v0.2.1
-
-**`redisstore/v0.2.0` is retracted. Upgrade to v0.2.1.**
-
-`redisstore/v0.2.0` was published with `go.mod` still requiring the core module
-at `v0.1.0`, whose `ratelimit.Store` interface declares `Take` rather than
-`TakeN`. Resolved fresh from the module proxy, `*redisstore.Store` therefore did
-not satisfy `ratelimit.Store` and the module did not compile:
-
-```
-cannot use (*Store)(nil) as ratelimit.Store value: missing method Take
-```
-
-Nothing local could see it: the development workspace lists all three modules
-under `use`, so `redisstore` resolved the core against the working tree and the
-stale `require` was never exercised. It was caught by fetching the published tag
-into a clean directory outside the repository and running real code against it.
-
-v0.2.1 requires the core at `v0.2.0` and carries a `retract v0.2.0` directive.
-The core module's own `v0.2.0` tag is unaffected and needs no reissue.
+- CI gains `released-satellites`, which builds, vets and tests each satellite
+  module with `GOWORK=off` against the core version its `go.mod` names. This is
+  the mechanism that would have caught the `redisstore/v0.2.0` break before it
+  was tagged; `CONTRIBUTING.md` now also fixes the release order that keeps it
+  green. See `doc/DESIGN.md` §6.0 and §6.16.
 
 ## v0.2.0
 
-Modules: `github.com/JonasBorgesLM/moat` and
-`github.com/JonasBorgesLM/moat/redisstore`, tagged together.
+`redisstore/v0.2.0` was tagged on the same commit, and broken — see the
+`redisstore` section below. Tagging the two in lockstep is what this project
+stopped doing as a result; `CONTRIBUTING.md` now specifies the order.
 
 ### BREAKING — source changes required
 
@@ -196,9 +196,99 @@ for it in the release window rather than being surprised by it.
 
 - The core module still requires **Go 1.24** and still depends on the standard
   library only — verified by building a consumer that imports all nine packages
-  on a go1.24 toolchain and produces no `go.sum`.
-- `redisstore` requires Go 1.25.
+  on a go1.24 toolchain and produces no `go.sum`. This has not changed since, and
+  the `redisstore` toolchain floor does not propagate to it.
 
 ## v0.1.0
 
 Initial release.
+
+---
+
+# `redisstore` — `github.com/JonasBorgesLM/moat/redisstore`
+
+Requires the core module. Which version of it, per release, is in
+`redisstore/README.md`; the numbers on the two modules do not track each other.
+
+## Unreleased (redisstore/v0.2.2)
+
+### Requirements — action may be needed
+
+- **The `go` directive is now `1.26.6`** (it was `1.25.0`, with a `toolchain
+  go1.26.6` line that consumers ignore). Building this module now requires Go
+  1.26.6 or newer: under the default `GOTOOLCHAIN=auto` an older toolchain
+  upgrades itself, under `GOTOOLCHAIN=local` the build fails with a clear
+  message.
+
+  This is a security floor, not a language-feature one. The module reaches
+  `crypto/tls` via go-redis and `encoding/asn1` via certificate parsing, which
+  carry [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090) and
+  [GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972). Up to `v0.2.1` the floor
+  was declared only in `toolchain`, which protected this repository's CI and no
+  consumer's build.
+
+  It is 1.26.6 rather than 1.25.13, though both carry the fixes: Go orders
+  versions across release lines, so a floor of 1.25.13 is satisfied by 1.26.5,
+  which has neither fix.
+
+  The core module is unaffected and still requires only Go 1.24.
+
+### Added
+
+- **`Store.EvictionCheck() EvictionCheck`** reports what the construction-time
+  eviction check actually established. Previously a check that was *skipped* —
+  `CONFIG` disabled or renamed, the server unreachable, a client that cannot
+  issue `CONFIG`, an unparsable reply — was indistinguishable from one that
+  passed: `New` returned a Store and no error either way.
+
+  This matters because the skip cases are the normal case on ElastiCache,
+  MemoryDB, Upstash and Azure Cache, which is where most production deployments
+  run. The check tended to fire in local Docker and stay silent in production.
+
+  Nothing about the check's behaviour changed and no call site needs updating.
+  What is new is being able to ask:
+
+  ```go
+  if check := store.EvictionCheck(); !check.Verified() {
+      log.Printf("redisstore: eviction policy unverified (%s)", check)
+  }
+  ```
+
+  The doc comment also now records two gaps a *verified* result does not close:
+  it is a snapshot of mutable server state taken once at construction, and in
+  cluster mode only the masters reachable at that moment are asked — so a policy
+  changed during a memory incident, or a replica promoted by failover, is not
+  covered.
+
+- `redisstore/README.md`, carrying the core-version compatibility table and the
+  toolchain floor.
+
+## redisstore/v0.2.1
+
+**`redisstore/v0.2.0` is retracted. Upgrade to v0.2.1.**
+
+`redisstore/v0.2.0` was published with `go.mod` still requiring the core module
+at `v0.1.0`, whose `ratelimit.Store` interface declares `Take` rather than
+`TakeN`. Resolved fresh from the module proxy, `*redisstore.Store` therefore did
+not satisfy `ratelimit.Store` and the module did not compile:
+
+```
+cannot use (*Store)(nil) as ratelimit.Store value: missing method Take
+```
+
+Nothing local could see it: the development workspace lists all three modules
+under `use`, so `redisstore` resolved the core against the working tree and the
+stale `require` was never exercised. It was caught by fetching the published tag
+into a clean directory outside the repository and running real code against it.
+
+v0.2.1 requires the core at `v0.2.0` and carries a `retract v0.2.0` directive.
+The core module's own `v0.2.0` tag is unaffected and needs no reissue.
+
+## redisstore/v0.1.0
+
+Initial release, tagged alongside the core's `v0.1.0` and requiring it. Verified
+after the fact from a clean directory against the module proxy: it compiles and
+`*Store` satisfies `ratelimit.Store`. It was correct by coincidence rather than
+by verification — nothing in the pipeline resolved the core outside the
+workspace until `e7c8801` — which is why it was re-checked rather than assumed.
+No retract is needed.

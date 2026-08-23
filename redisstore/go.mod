@@ -4,9 +4,28 @@
 // consumers who only import the core packages. See doc/DESIGN.md §2.
 module github.com/JonasBorgesLM/moat/redisstore
 
-go 1.25.0
-
-toolchain go1.26.6
+// 1.26.6, not 1.25.x, and stated as a full patch version on purpose.
+//
+// This module reaches crypto/tls (through go-redis) and encoding/asn1 (through
+// certificate parsing on a TLS connection to Redis), which are the two packages
+// carrying GO-2026-6090 and GO-2026-5972. Both are fixed in 1.25.13 and in
+// 1.26.6.
+//
+// `toolchain go1.26.6` used to be the only floor here, and a toolchain line is
+// ignored by anyone importing the module (DESIGN.md §6.13) — so it protected
+// this repository's CI and nobody else. The `go` directive is not ignored: with
+// GOTOOLCHAIN=auto, the default, a consumer on an older toolchain downloads and
+// switches to this one, and with GOTOOLCHAIN=local they get a clear refusal
+// instead of a silent vulnerable build.
+//
+// `go 1.25.13` would NOT do the job, and the reason is worth spelling out
+// because it looks like the more conservative choice. Go orders versions across
+// lines, so 1.26.5 satisfies a floor of 1.25.13 — and 1.26.5 is vulnerable to
+// both. Only 1.26.6 covers the 1.26 line as well as the 1.25 one.
+//
+// The core module stays at go 1.24 and is unaffected: it has no dependencies and
+// reaches neither package. See README.md in this directory.
+go 1.26.6
 
 // v0.2.0 was published requiring the core module at v0.1.0, whose
 // ratelimit.Store interface still declares Take rather than TakeN. *Store

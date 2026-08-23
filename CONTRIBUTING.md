@@ -47,6 +47,29 @@ go test -tags=integration ./integration/...
 (cd redisstore && go test -tags=integration ./...)
 ```
 
+You need **Go 1.26.6 or newer** to work in this repository, because `redisstore`
+declares that floor (see `redisstore/README.md` for why). The core module itself
+still requires only 1.24, and that is checked separately in CI. If `go work init`
+complains that a module requires a newer Go than the workspace lists, the fix is
+`go work edit -go=1.26.6`.
+
+### Working the way a consumer resolves
+
+Every command above runs inside the workspace, where the satellites resolve the
+core from the **working tree** and their `require` lines on it are inert. That is
+the convenience; it is also a blind spot, and it is the one that shipped
+`redisstore/v0.2.0` broken (DESIGN.md §6.16). To resolve the way a consumer does:
+
+```sh
+(cd redisstore && GOWORK=off go build ./... && GOWORK=off go test ./...)
+(cd examples   && GOWORK=off go build ./... && GOWORK=off go test ./...)
+```
+
+That is what the `released-satellites` CI job runs, so a failure there reproduces
+here. Note that a cross-module change will fail this until the core carrying it
+is tagged — see "Release order" below; that is the job working, not a broken
+setup.
+
 ## The dependency rule
 
 **The core module depends on the Go standard library only.** This is not
@@ -288,6 +311,50 @@ the store. The project stays on `v0.x` until the API has been used in anger;
 claiming `v1` early is a compatibility promise we are not yet in a position to
 keep. Post-v1, a breaking change needs a new major version and module path
 suffix.
+
+Independent tagging means the version numbers of the core and a satellite carry
+no compatibility information about each other — `redisstore/v0.2.1` requires the
+core at `v0.2.0`, and they will keep drifting. The compatibility table in
+`redisstore/README.md` is where that information lives, and it is part of the
+release, not documentation to be caught up on later.
+
+## Release order
+
+The order below is not a preference. Doing it in a different order is what
+shipped `redisstore/v0.2.0` broken (DESIGN.md §6.16), and it is the reason the
+`released-satellites` CI job exists.
+
+Releasing the core and a satellite together:
+
+1. **Tag and push the core** (`v0.3.0`). Nothing about the satellites yet.
+2. **Bump the satellite's `require`** on the core to that version, in its own
+   commit, and run `go mod tidy` in the satellite directory with `GOWORK=off` —
+   `tidy` ignores `go.work`, but `GOWORK=off` also makes `go list`/`go build`
+   in the same shell resolve the way a consumer does.
+3. **Wait for `released-satellites` to go green** on that commit. It resolves
+   the satellite against the proxy at the version its `go.mod` names, which is
+   the only check in the pipeline that exercises cross-module resolution at all.
+4. **Tag and push the satellite** (`redisstore/v0.3.0`).
+5. **Clean-room fetch** both from the proxy, into a directory outside the repo,
+   and run real code against them.
+
+Done in that order there is no window where CI is legitimately red: the core
+version the satellite names is already published at the moment the bump is
+committed. If you find yourself wanting to bump the require *before* tagging the
+core, stop — that is the failure mode itself.
+
+### When red is expected
+
+One case is legitimate: a PR that changes a core API and its satellite consumers
+together, before the core carrying that change is tagged. The satellite's
+require still names the previous core, so `released-satellites` fails, correctly.
+
+Label that PR `cross-module-window` and the job skips. Do not disable the job,
+do not weaken it to a warning, and do not merge with the label still on a branch
+that no longer needs it — the label is visible on the PR precisely so that the
+skip is a thing somebody chose, in the same spirit as
+`redisstore.InsecureAllowKeyEviction`. After merging, follow the release order
+above; the label is not a substitute for step 3.
 
 ## License
 

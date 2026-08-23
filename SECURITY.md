@@ -30,6 +30,39 @@ receives security fixes.
 Older `v0.x` tags are not patched. Because the API may still change between
 minor versions, upgrading is the fix.
 
+`redisstore/v0.2.0` is **retracted** and does not compile; see
+`doc/DESIGN.md` §6.16. `go get` will not select it, but a `go.mod` that pins it
+explicitly still needs changing.
+
+### Required Go toolchain
+
+The toolchain a consumer builds with is part of this library's security posture,
+because the standard library is where most of the reachable vulnerability surface
+lives — the core module has no external dependencies at all.
+
+| Module | `go` directive | Why |
+|---|---|---|
+| `github.com/JonasBorgesLM/moat` (core) | **1.24** | The floor set by `os.Root`, which `pathguard` is built on. No dependencies, and neither `crypto/tls` nor `encoding/asn1` is reachable from it. |
+| `github.com/JonasBorgesLM/moat/redisstore` | **1.26.6** | Reaches `crypto/tls` via `go-redis` and `encoding/asn1` via certificate parsing. [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090) and [GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972) are fixed in 1.25.13 and 1.26.6. |
+
+Two things about the `redisstore` floor are worth stating explicitly, because
+both were wrong in `redisstore/v0.2.1` and earlier:
+
+- It is declared in the **`go` directive**, not `toolchain`. A `toolchain` line
+  in a dependency is ignored by whoever imports it, so a floor declared there
+  protects this repository's CI and nobody else's build. That was the state up to
+  `redisstore/v0.2.1`: the two vulnerabilities above were fixed for the
+  maintainer and for no consumer. The `go` directive is honoured — under the
+  default `GOTOOLCHAIN=auto` an older toolchain is upgraded automatically, and
+  under `GOTOOLCHAIN=local` the build fails with a clear message.
+- It is **1.26.6, not 1.25.13**, though both carry the fixes. Go orders versions
+  across release lines, so a floor of `1.25.13` is satisfied by `1.26.5`, which
+  has neither fix.
+
+If you build `redisstore` with an older toolchain by overriding this, both
+vulnerable paths are reachable in your binary regardless of what this library
+does.
+
 ## Reporting a vulnerability — privately
 
 **Do not open a public issue, pull request, or discussion for a security

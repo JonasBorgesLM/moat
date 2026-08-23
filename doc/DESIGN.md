@@ -1047,6 +1047,15 @@ These are treated as requirements, not nice-to-haves.
    made impossible-by-accident (§3.3).
 3. **Framework adapters** for Gin and Echo, living as compiled, tested code in
    the `examples/` module — not as prose snippets that silently rot.
+
+   One correction to that claim, since it was stated more broadly than it held.
+   Up to and including v0.2.0 the adapters were compiled and tested — against
+   the **working tree**, through `go.work`, while `examples/go.mod` declared a
+   `require` on the core that nothing ever resolved. So the guarantee was real,
+   but it was a guarantee about the code in this repository, not about the
+   version the file claimed to build against. §6.16 is the same defect reaching
+   a published tag. The `released-satellites` CI job now builds `examples/` with
+   `GOWORK=off`, which is what makes the sentence above true as written.
 4. **Testable examples (`ExampleXxx`)** in every public package, rendered on
    pkg.go.dev and compiled by `go test`, so documentation cannot drift from the
    API. Examples that would depend on wall-clock timing or network are written
@@ -1065,6 +1074,49 @@ These are treated as requirements, not nice-to-haves.
 
 Recorded because the reasoning is the deliverable, and because several of these
 were real defects in the first design pass.
+
+### 6.0 Policy: a finding whose fix is "remember to X" is not closed
+
+This is policy, not a log entry, and it was earned three times over.
+
+- §6.13 closed a class of bug with a guard named after the single instance that
+  had been found, which left the class open.
+- §6.15 (MEDIUM-2) found that the remedy against instance-level guards had
+  itself been applied at the instance.
+- §6.16 closed a released-broken satellite module with a **standing item** — a
+  sentence in this document asking a future release to remember something. The
+  mechanism that would have caught it was known at the time, was written into
+  the commit message ("Running the satellite test suites with `GOWORK=off`
+  before tagging would have caught this locally"), and was not built. The
+  commit touched six files and none of them was in `.github/`.
+
+The third one is the informative one, because the failure was not ignorance. The
+mechanism was identified, articulated, and skipped — and it was skipped at the
+moment of tagging a release, which is exactly when a checklist gets the least
+attention.
+
+**The rule:** a finding whose remedy is "remember to do X" is not closed while
+the only thing standing between the project and a repeat is somebody
+remembering. It is closed when there is a mechanism that fails, loudly and by
+default, when X is skipped. A checklist item cannot fail. Nobody is paged when
+it is forgotten, and no record exists that it was.
+
+Two consequences worth stating, because both are ways this rule gets quietly
+broken:
+
+- **The mechanism has to be shown red.** A guard that has never failed on the
+  bug it exists to catch is a guess. §6.16's job was verified by putting the
+  original stale `require` back and watching the build fail with
+  `*Store does not implement ratelimit.Store (missing method Take)` — the exact
+  error a consumer got from the published tag.
+- **The bypass, where one is genuinely needed, is explicit and visible.** Not a
+  disabled job, not a warning: a named opt-out somebody has to type, on the
+  record. `redisstore.InsecureAllowKeyEviction` is the shape; the
+  `cross-module-window` PR label is the same shape applied to CI.
+
+Checklists still have a place — the review checklist in `CONTRIBUTING.md` covers
+properties no tool can currently assert, and says so in each entry. The rule is
+that a checklist is not where a finding *ends* when a mechanism was available.
 
 ### 6.1 Ordering bugs are security bugs (found in the first draft)
 
@@ -1715,10 +1767,164 @@ process that exercises inter-module version resolution at all. `redisstore`'s
 tag was reissued as v0.2.1 with `retract v0.2.0`, since a published tag is
 immutable once the proxy has cached it.
 
-**Standing item:** any release that changes an API the satellite modules consume
-must bump their `require` on the core *before* tagging, and the clean-room fetch
-must run against the real tags rather than a `replace`. Running the satellite
-test suites with `GOWORK=off` before tagging would have caught this locally.
+#### How far back it goes: the `go.sum` evidence
+
+The stale pin was not a slip in one release. Both satellites' `go.sum` files
+gained their first line for `github.com/JonasBorgesLM/moat` in `e7c8801` — the
+commit that fixed this finding. Before that, `redisstore/go.sum` and
+`examples/go.sum` had entries for go-redis, testcontainers, gin, echo and their
+transitive trees, and no entry for the one module both of them exist to extend:
+
+```
+$ git log --oneline -p -- redisstore/go.sum | grep -E '^[0-9a-f]{7} |JonasBorgesLM/moat '
+e7c8801 redisstore: require the core at v0.2.0 and retract redisstore/v0.2.0
++github.com/JonasBorgesLM/moat v0.2.0 h1:4GWDJInGeIgLmdeUxzK2ckUT1WBBhffWyoZP5hSW0v0=
++github.com/JonasBorgesLM/moat v0.2.0/go.mod h1:65xs3itYF+S7xsAZ32o0N7FvZj1564SDquOvmE2nD0o=
+e2d961e Implement the library described in doc/DESIGN.md
+```
+
+A `go.sum` with no hash for a declared dependency means that dependency was
+never resolved outside the workspace — not "not since the last release", but
+never, since `e2d961e`. `go mod tidy` would not have added it either: `tidy`
+honours the workspace like everything else. So `redisstore/v0.1.0` and every
+`examples/` build up to that point were published or verified under the same
+unchecked condition; `v0.2.0` is only where the condition finally produced a
+visible break, because it is where the interface changed.
+
+`redisstore/v0.1.0` was therefore re-checked from a clean directory outside the
+repository, resolved through the proxy with `GOWORK=off`. It builds, and
+`*Store` satisfies `ratelimit.Store` — it names the core at `v0.1.0`, which was
+consistent at the time. It was correct by coincidence rather than by
+verification, which is why it was checked rather than assumed. No retract is
+needed for it.
+
+#### Closed with a mechanism, not a standing item
+
+The original close for this finding was a standing item in this document asking
+future releases to remember two things. That is precisely the shape §6.0 now
+rules out, and this finding is the reason §6.0 exists.
+
+What closes it instead:
+
+- **`released-satellites`**, a CI job that builds, vets, tests and
+  `go mod verify`s each satellite with `GOWORK=off`, resolving the core from the
+  proxy at the version its `go.mod` actually names. It asserts no workspace is
+  active before doing anything, so it cannot pass for the wrong reason.
+- **Verified red.** Restoring the original `require github.com/JonasBorgesLM/moat
+  v0.1.0` and building with `GOWORK=off` fails with
+  `cannot use (*Store)(nil) ... *Store does not implement ratelimit.Store
+  (missing method Take)`, the same error the published tag gave consumers.
+  Restoring `v0.2.0` makes it pass.
+- **A written release order** in `CONTRIBUTING.md` — tag core, bump the
+  satellite require, green `released-satellites`, tag satellite, clean-room
+  fetch — which removes the chicken-and-egg window rather than papering over it,
+  since the core version the satellite names is already published when the bump
+  is committed.
+- **A visible bypass** for the one legitimate red case (a PR changing a core API
+  and its consumers together): the `cross-module-window` label, chosen by a
+  human and on the record.
+
+The clean-room fetch keeps its place as the last step, but it is no longer the
+*only* check that exercises inter-module resolution, which is what made it
+load-bearing in a way a release step should not be.
+
+### 6.17 R6: a review whose central finding was not reproducible
+
+This round started from an external review that reported, with a table of
+evidence, that the published `main` branch was missing much of the v0.2.0 work:
+no `realip/`, no `secret/`, no `CHANGELOG.md`, a README declaring "Requires Go
+1.25+" against a `go.mod` saying 1.24, no mention of `preset.Config.TrustedProxies`,
+and a quick-start snippet in its pre-`secret.Value` form. The proposed conclusion
+was that the `v0.2.0` tag was not an ancestor of `main` — that the published
+module existed only on the tag, and the branch a visitor reads first described an
+API the release no longer had. Everything else was to be blocked behind fixing it.
+
+None of it reproduced. Recorded here in full, because a finding that was chased
+and refuted is worth as much in this log as one that was fixed:
+
+```
+$ for t in $(git tag -l); do
+    git merge-base --is-ancestor "$t" main && echo "$t -> ancestor" || echo "$t -> NOT ancestor"
+  done
+redisstore/v0.1.0 -> ancestor
+redisstore/v0.2.0 -> ancestor
+redisstore/v0.2.1 -> ancestor
+v0.1.0 -> ancestor
+v0.2.0 -> ancestor
+
+$ git ls-tree -r --name-only main -- realip secret CHANGELOG.md
+CHANGELOG.md
+realip/realip.go
+realip/realip_test.go
+secret/mask_internal_test.go
+secret/secret.go
+secret/secret_test.go
+```
+
+Byte-identical to the same listing against `v0.2.0`. `main` is `dea0800`, two
+commits *ahead* of the `v0.2.0` tag and one ahead of `redisstore/v0.2.1`; the
+README says "The core module requires **Go 1.24+**", lists both `realip` and
+`secret` in the package table, documents `TrustedProxies` in three places, and
+its quick start decodes into `raw` before wrapping it with `secret.New`. The only
+branches that are not merged are four Dependabot bumps, each a single commit
+against `.github/workflows/ci.yml`.
+
+The mechanism is mundane and worth naming so the next reader recognises it: the
+review was working from a cached or stale view of the repository, one that
+predates the release. Every individual observation in it was true of some earlier
+state, which is exactly what makes that kind of report persuasive — it is
+internally consistent, and it is consistent with a snapshot that really existed.
+
+The generalisable lesson is not about that reviewer. It is that **a claim about
+repository state is verifiable in one command, and a report that asserts one
+without showing the command has not made a finding — it has made a hypothesis.**
+The correct response was to run the commands before acting on the conclusion, and
+the cost of not doing so would have been high: the proposed remediation was to
+"bring the v0.2.0 work back to main", which against a `main` that already has it
+means rewriting a correct branch on the strength of a stale reading.
+
+Two smaller claims from the same review were also refuted by measurement rather
+than argument, and both had been offered as near-certainties:
+
+- **`redisstore/v0.1.0` "was probably published under the same unverified
+  condition and may need retracting."** The premise is right — the `go.sum`
+  evidence in §6.16 shows the core was never resolved outside the workspace, so
+  the tag was never verified. The conclusion is wrong. Fetched from the proxy
+  into a clean directory with `GOWORK=off`, it builds and `*Store` satisfies
+  `ratelimit.Store`: it names the core at `v0.1.0`, which was consistent at the
+  time. Correct by coincidence, but correct. No retract.
+
+- **"Raise the `redisstore` `go` directive to 1.26.6."** The right action, for a
+  reason the review did not give and that changes what the alternative would have
+  been. Both GO-2026-6090 and GO-2026-5972 are fixed in **1.25.13 as well as
+  1.26.6**, so a floor of `go 1.25.13` looks like the more conservative choice.
+  It is not, and it would have been silently useless: Go orders versions across
+  release lines, so `1.26.5` satisfies a `1.25.13` floor — and 1.26.5 has neither
+  fix. Only 1.26.6 covers both lines. A "more conservative" floor here would have
+  left the exact consumers most likely to be affected unprotected.
+
+What the review got right, and what this round therefore acted on, is that
+§6.16's close was a checklist item where a mechanism was available and known.
+That is §6.0, and it is the substantive outcome of the round. The rest of the
+work — the eviction check's skipped state becoming reportable, the toolchain
+floor moving to the `go` directive, the compatibility table, the `realip`
+examples, the split changelog — all stands on its own and is recorded in the
+sections it belongs to.
+
+#### Round summary
+
+| # | Claim | Verdict |
+|---|---|---|
+| 1 | `main` is missing the v0.2.0 work; `v0.2.0` is not an ancestor | **Refuted.** All five tags are ancestors; `main` is two commits ahead |
+| 2 | README contradicts `go.mod` on the Go floor | **Refuted.** README says 1.24+, matching `go.mod` |
+| 3 | README lacks `secret`, `realip`, `TrustedProxies`; snippet is pre-M1 | **Refuted.** All present |
+| 4 | §6.16 was closed with a checklist item where a mechanism was known | **Confirmed.** Closed with `released-satellites`, verified red (§6.0) |
+| 5 | Satellites' `go.sum` never carried the core until `e7c8801` | **Confirmed.** Evidence in §6.16 |
+| 6 | `redisstore/v0.1.0` may need retracting | **Refuted by clean-room build.** No retract |
+| 7 | `redisstore` `go` directive should be 1.26.6 | **Confirmed**, for a sharper reason: 1.25.13 would not have worked |
+| 8 | The eviction check is silent exactly where it matters | **Confirmed.** `Store.EvictionCheck` added |
+| 9 | Versions have drifted, so a compatibility table is needed | **Confirmed.** Added; §8 corrected |
+| 10 | `realip` has no examples | **Confirmed.** Three added |
 
 ---
 
@@ -1752,7 +1958,25 @@ CI runs, per module: `go vet`, `staticcheck`, `gosec`, `go build`,
   is not yet in a position to keep.
 - Post-v1, the exported API follows the Go compatibility promise; breaking
   changes require a new major version and module path suffix.
-- Each module is tagged independently (`v0.3.0`, `redisstore/v0.3.0`).
+- Each module is tagged independently (`v0.3.0`, `redisstore/v0.3.0`). That
+  sentence was written when the numbers happened to match, and the example above
+  reads as a convention of tagging in lockstep. **It is not one, and it no longer
+  describes reality**: `redisstore/v0.2.1` was issued on its own to fix §6.16
+  while the core stayed at `v0.2.0`, and the two have not been in step since.
+
+  The consequence is worth stating rather than leaving to be inferred. Once the
+  numbers diverge, a satellite's version carries no information about which core
+  it works with — and the contract between them is an interface that has already
+  broken once. So the mapping is written down explicitly, in the compatibility
+  table in `redisstore/README.md`, and updating it is part of the release rather
+  than documentation to catch up on afterwards. `CHANGELOG.md` is split by module
+  for the same reason: a single timeline invites reading `redisstore/v0.2.1` as
+  superseding the core's `v0.2.0`, when in fact it requires it.
+
+- **Release order is specified** in `CONTRIBUTING.md`, and is a mechanism rather
+  than a preference: tag the core, bump the satellite's `require`, wait for the
+  `released-satellites` job, then tag the satellite. Doing it in another order is
+  what produced §6.16.
 - **`v0.1.0` (core) and `redisstore/v0.1.0` were tagged on the commit that
   closes §6.11** — after the rename to `moat`, after the `preset.API`
   ordering fix, and after both self-found bugs were verified and swept for
@@ -1803,6 +2027,25 @@ would survive a reviewer with different instincts is untested.
 and no access to this document's reasoning, working from the public API and the
 README as a consumer would. Until then, §6.14 and §6.15 should be read as what
 they are — structured self-review that found things — and not as an audit.
+
+**Still not met as of R6.** R6 (§6.17) came from outside this session, which is
+closer to the bar than §6.14 or §6.15 were, and it found one real thing: that
+§6.16 had been closed with a checklist item where a mechanism was available. That
+is worth something.
+
+It does not close this item, for two reasons that should be stated rather than
+glossed. The first is that it was the same model reviewing its own work from a
+different session — a clean session is a weaker condition than an independent
+reviewer, and with the same model on both sides it is close to the minimum that
+could be called independent at all. The second is that its central finding, the
+one everything else was staged behind, was not reproducible: it asserted a
+repository state that a single `git merge-base` refutes, and it asserted it
+without running one. A pass that opens with an unverified claim about
+verifiable state has not demonstrated the property this item is asking for.
+
+So the item stays open, and `v0.2.2` will ship with it open. Marking it met on
+the strength of R6 would be exactly the kind of accounting the item exists to
+prevent.
 
 Threat-model limitations, restated because they matter more than the feature list:
 
