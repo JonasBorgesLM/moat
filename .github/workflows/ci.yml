@@ -137,8 +137,13 @@ jobs:
         env:
           GOWORK: "off"
         run: |
-          if [ -n "$(go env GOWORK)" ]; then
-            echo "::error::a workspace is active; this job proves nothing"
+          # `go env GOWORK` prints "off" when disabled and the path to the
+          # workspace file when one is in effect -- it is not empty in the
+          # disabled case. Compare against "off" rather than testing for
+          # emptiness, which reads correct and is not.
+          gowork="$(go env GOWORK)"
+          if [ "$gowork" != "off" ]; then
+            echo "::error::a workspace is in effect ($gowork); this job proves nothing"
             exit 1
           fi
           echo "resolving github.com/JonasBorgesLM/moat at:"

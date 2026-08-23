@@ -263,6 +263,20 @@ Requires the core module. Which version of it, per release, is in
 - `redisstore/README.md`, carrying the core-version compatibility table and the
   toolchain floor.
 
+### Fixed — security
+
+- `github.com/moby/go-archive` bumped `v0.2.0` → `v0.3.0` for
+  [GHSA-hfg8-hc9c-6c3h](https://github.com/advisories/GHSA-hfg8-hc9c-6c3h)
+  (CVE-2026-17106, high): a crafted tar archive can write outside the extraction
+  directory. It arrives transitively through `testcontainers-go` and is reachable
+  only from the integration suite, never from a consumer's build — `govulncheck`
+  reports it as uncalled — but a path-traversal advisory sitting unactioned in a
+  library that ships `pathguard` is not a good look, and the fix is a version
+  bump.
+
+  Found by Dependabot alerts within minutes of enabling them, which is the
+  argument for having had them on.
+
 ## redisstore/v0.2.1
 
 **`redisstore/v0.2.0` is retracted. Upgrade to v0.2.1.**
