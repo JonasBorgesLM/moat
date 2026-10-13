@@ -148,17 +148,23 @@ func responseWritingSites(t *testing.T) []string {
 		case "examples", "redisstore":
 			return filepath.SkipDir // separate modules
 		}
-		fset := token.NewFileSet()
-		pkgs, perr := parser.ParseDir(fset, path, func(fi fs.FileInfo) bool {
-			return !strings.HasSuffix(fi.Name(), "_test.go")
-		}, 0)
-		if perr != nil {
-			t.Fatalf("parsing %s: %v", path, perr)
+		// File by file rather than parser.ParseDir, which is deprecated. Like
+		// ParseDir, this ignores build tags: every non-test file counts.
+		entries, rerr := os.ReadDir(path)
+		if rerr != nil {
+			return rerr
 		}
-		for name, pkg := range pkgs {
-			for _, file := range pkg.Files {
-				collectSites(name, file, seen)
+		fset := token.NewFileSet()
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
 			}
+			file, perr := parser.ParseFile(fset, filepath.Join(path, name), nil, 0)
+			if perr != nil {
+				t.Fatalf("parsing %s: %v", filepath.Join(path, name), perr)
+			}
+			collectSites(file.Name.Name, file, seen)
 		}
 		return nil
 	})
