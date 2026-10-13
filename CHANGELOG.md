@@ -22,6 +22,24 @@ it. The mapping lives in `redisstore/README.md`.
 
 ## Unreleased
 
+### Requirements — action may be needed
+
+- **The `go` directive is now `1.27.2`** (it was `1.24`, with a `toolchain
+  go1.26.6` line that consumers ignore). Building this module now requires Go
+  1.27.2 or newer: under the default `GOTOOLCHAIN=auto` an older toolchain
+  upgrades itself, under `GOTOOLCHAIN=local` the build fails with a clear
+  message.
+
+  This is a security floor. govulncheck reports the core reaching
+  GO-2026-6617, -6613, -6612, -6611 and -6603 in `net/http`, and GO-2026-6604
+  in `os.Root`, which is `pathguard`'s containment mechanism. All are fixed in
+  1.26.9 and 1.27.2. It is 1.27.2 because a 1.26.9 floor is satisfied by 1.27.0
+  and 1.27.1, which carry none of the fixes. `os.Root`'s 1.24 is still the
+  technical floor; `doc/DESIGN.md` §6.18 records why the declared one is now
+  higher.
+
+### Other
+
 - `realip` gains three runnable examples (`ExampleNew`,
   `ExampleExtractor_KeyFunc`, `ExampleNew_viaPreset`). It was the package with no
   indexed example on pkg.go.dev, which is a poor place for that gap given it is
@@ -209,6 +227,16 @@ Initial release.
 
 Requires the core module. Which version of it, per release, is in
 `redisstore/README.md`; the numbers on the two modules do not track each other.
+
+## redisstore/Unreleased
+
+### Requirements — action may be needed
+
+- **The `go` directive is now `1.27.2`** (it was `1.26.6`). Same reason as
+  `v0.2.2`'s raise, with new IDs: GO-2026-6607 in `crypto/tls`, and
+  GO-2026-6617, -6613, -6612, -6611 and -6603 in `net/http`. All are fixed in
+  1.26.9 and 1.27.2, and 1.27.2 because a 1.26.9 floor admits 1.27.0 and
+  1.27.1.
 
 ## redisstore/v0.2.2
 

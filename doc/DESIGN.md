@@ -1172,6 +1172,10 @@ toolchain its authors happen to run: every release above the floor is a
 consumer excluded for no reason. The core has zero external dependencies, so
 nothing pushes it past `os.Root`.
 
+*(Superseded for the declared floor by §6.18: the core now declares 1.27.2 as a
+security floor. 1.24 remains the technical one, and the reasoning above is why
+the two are now told apart rather than conflated.)*
+
 The two satellite modules do declare **1.25**, and not by choice —
 `redisstore` because `testcontainers-go` requires 1.25, `examples/` because
 `gin` does. `go mod tidy -go=1.24.0` refuses in both. Since neither module is
@@ -2047,6 +2051,43 @@ are the mechanisms working rather than failing:
   two things nothing checked.
 
 ---
+
+### 6.18 The core's declared floor becomes a security floor (1.27.2)
+
+The CI's weekly govulncheck run turned `main` red: the core, `redisstore` and
+`examples` all reached standard-library vulnerabilities at the go1.26.6
+toolchain CI was pinned to. That much was a stale toolchain. What made it a
+design question was the core. B-3 (§6.13) recorded the core as clean "because it
+reaches neither package", and §6.7 kept its `go` directive at the technical
+floor, 1.24. Neither holds any longer. govulncheck reports the core reaching
+GO-2026-6617, -6613, -6612, -6611 and -6603 in `net/http`, and GO-2026-6604 in
+`os`. The last is `os.Root`, the mechanism `pathguard` exists to rely on.
+
+**Decision: the core's `go` directive is 1.27.2, as is `redisstore`'s.** It
+makes the same move `redisstore/v0.2.2` made, for the same reason, and
+`SECURITY.md` already states the rule: a floor in `toolchain` protects this
+repository's CI and nobody else's build. 1.27.2 rather than 1.26.9 because Go
+orders versions across release lines, so a 1.26.9 floor admits 1.27.0 and
+1.27.1, which carry none of the fixes. The CI toolchain follows from the `go`
+directive, because `setup-go` reads `go-version-file`, so there is no separate
+`toolchain` line left to go stale.
+
+**The option not taken: keep 1.24 and document the residual.** §6.7's argument
+is real: every version above the technical floor excludes a consumer, and the
+core has no dependency forcing it up. It loses here because the consumers it
+would keep are exactly the ones building with a toolchain whose `os.Root` can
+be walked out of on Windows. That is a containment failure in the package whose
+only job is containment. A library cannot fix its consumers' toolchain, but it
+can refuse to be built with a known-bad one, and the `go` directive is the only
+lever it has.
+
+**What it costs.** Every importer of the core now needs Go 1.27.2. That includes
+first-party libraries that promise a lower floor of their own: `crier`'s
+`receivers/http` declares 1.24 under its NFR2, and it imports the core. Its
+next upgrade of `moat` moves its floor too, and that is `crier`'s decision to
+record, not this repository's. `usher` already declares 1.27.2. As before, the
+core's declared floor is also no longer the one CI could exercise against 1.24
+(B-3); that gap is now moot, because 1.24 is no longer a supported floor.
 
 ## 7. Testing strategy
 

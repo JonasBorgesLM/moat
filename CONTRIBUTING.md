@@ -47,11 +47,10 @@ go test -tags=integration ./integration/...
 (cd redisstore && go test -tags=integration ./...)
 ```
 
-You need **Go 1.26.6 or newer** to work in this repository, because `redisstore`
-declares that floor (see `redisstore/README.md` for why). The core module itself
-still requires only 1.24, and that is checked separately in CI. If `go work init`
+You need **Go 1.27.2 or newer** to work in this repository, because every
+module declares that floor (see `SECURITY.md` for why). If `go work init`
 complains that a module requires a newer Go than the workspace lists, the fix is
-`go work edit -go=1.26.6`.
+`go work edit -go=1.27.2`.
 
 ### Working the way a consumer resolves
 
