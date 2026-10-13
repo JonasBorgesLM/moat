@@ -25,7 +25,7 @@ module github.com/JonasBorgesLM/moat/redisstore
 //
 // The core module stays at go 1.24 and is unaffected: it has no dependencies and
 // reaches neither package. See README.md in this directory.
-go 1.26.6
+go 1.27.2
 
 // v0.2.0 was published requiring the core module at v0.1.0, whose
 // ratelimit.Store interface still declares Take rather than TakeN. *Store

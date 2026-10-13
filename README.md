@@ -73,21 +73,20 @@ Optional Redis-backed distributed rate limiting (separate module, pulls in
 go get github.com/JonasBorgesLM/moat/redisstore
 ```
 
-The core module requires **Go 1.24+** — the floor set by `os.Root`, which
-`pathguard` is built on and which landed in 1.24. The core has no external
-dependencies, so nothing pushes it higher.
+Both modules require **Go 1.27.2 or newer**, and both floors are security
+floors rather than language-feature ones. The core reaches standard-library
+code with known vulnerabilities, all fixed in 1.26.9 and 1.27.2:
+GO-2026-6617, -6613, -6612, -6611 and -6603 in `net/http`, and GO-2026-6604 in `os`.
+GO-2026-6604 is in `os.Root` itself, which `pathguard` is built on. `redisstore`
+reaches the same `net/http` set and GO-2026-6607 in `crypto/tls`.
 
-The `redisstore` module declares **Go 1.26.6**, and that one is a security floor
-rather than a dependency floor: it reaches `crypto/tls` and `encoding/asn1`,
-which carry [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090) and
-[GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972), fixed in 1.25.13 and
-1.26.6. It is declared in the `go` directive rather than `toolchain`, because a
-`toolchain` line in a dependency is ignored by whoever imports it — see
-[`redisstore/README.md`](./redisstore/README.md) for why 1.25.13 would not have
-done the job. `examples/` declares 1.25, forced there by `gin`.
-
-Neither floor affects you unless you import those modules. The core is unchanged
-at 1.24.
+It is 1.27.2 rather than 1.26.9, though both carry every fix: Go orders
+versions across release lines, so a floor of 1.26.9 is satisfied by 1.27.0 and
+1.27.1, which carry none. The floor is declared in the `go` directive rather
+than `toolchain`, because a `toolchain` line in a dependency is ignored by
+whoever imports it. See [`SECURITY.md`](./SECURITY.md) and `doc/DESIGN.md`
+§6.18. The core's technical floor is still `os.Root`'s 1.24; the declared
+floor is higher on purpose.
 
 ## Packages
 

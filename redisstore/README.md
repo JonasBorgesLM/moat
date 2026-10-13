@@ -37,18 +37,20 @@ even if they also require an older one directly.
 
 ## Go toolchain floor
 
-**This module requires Go 1.26.6 or newer**, declared in its `go` directive. The
-core module requires only 1.24 and is unaffected by this — the floor here is not
-inherited by anyone importing `moat` alone.
+**This module requires Go 1.27.2 or newer**, declared in its `go` directive.
+The core declares the same floor, for its own reasons (`SECURITY.md`).
 
 The reason is a security one rather than a language-feature one. This module
-reaches `crypto/tls` through `go-redis`, and `encoding/asn1` through certificate
-parsing on a TLS connection to Redis. Both carry known vulnerabilities:
+reaches `crypto/tls` through `go-redis`, `encoding/asn1` through certificate
+parsing on a TLS connection to Redis, and `net/http`. Each carries known
+vulnerabilities:
 
 | ID | Package | Fixed in |
 |---|---|---|
 | [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090) | `crypto/tls` — unbounded post-handshake messages | 1.25.13, 1.26.6 |
 | [GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972) | `encoding/asn1` — unbounded recursion depth | 1.25.13, 1.26.6 |
+| [GO-2026-6607](https://pkg.go.dev/vuln/GO-2026-6607) | `crypto/tls` — malformed ECH outer extension references | 1.26.9, 1.27.2 |
+| [GO-2026-6617](https://pkg.go.dev/vuln/GO-2026-6617), [-6613](https://pkg.go.dev/vuln/GO-2026-6613), [-6612](https://pkg.go.dev/vuln/GO-2026-6612), [-6611](https://pkg.go.dev/vuln/GO-2026-6611), [-6603](https://pkg.go.dev/vuln/GO-2026-6603) | `net/http` — HTTP/1 and HTTP/2 server | 1.26.9, 1.27.2 |
 
 Two details in how that floor is declared, both deliberate:
 
@@ -59,11 +61,12 @@ Two details in how that floor is declared, both deliberate:
   downloads and switches to a conforming one, and under `GOTOOLCHAIN=local` they
   get an explicit refusal rather than a silently vulnerable binary.
 
-- **It is 1.26.6, not 1.25.13**, even though 1.25.13 also carries both fixes. Go
-  orders versions across release lines, so a floor of `1.25.13` is satisfied by
-  `1.26.5` — which has neither fix. Only 1.26.6 covers both lines.
+- **It is 1.27.2, not 1.26.9**, even though 1.26.9 also carries every fix. Go
+  orders versions across release lines, so a floor of `1.26.9` is satisfied by
+  `1.27.0` and `1.27.1`, which have none. Only 1.27.2 covers both lines. (1.26.6
+  was chosen over 1.25.13 before for the same reason.)
 
-If a 1.26.6 floor is not workable for you, pin `redisstore/v0.2.1` and enforce
+If a 1.27.2 floor is not workable for you, pin an older tag and enforce
 the toolchain version in your own build. What you must not do is assume the
 older tag is safe because it declares a lower number; it is the same code with
 an unenforced floor.

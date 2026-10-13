@@ -26,8 +26,11 @@ permissions:
 
 env:
   # Pinned tool versions. Bump these deliberately, in their own commit.
-  STATICCHECK_VERSION: v0.7.0
-  GOSEC_VERSION: v2.28.0
+  STATICCHECK_VERSION: v0.8.2
+  # A master commit, not a tag: no gosec release reads Go 1.27 export data
+  # yet (v2.29.0 included). Same pin as usher, sapper and task-api; back to
+  # a tag when one can.
+  GOSEC_VERSION: d2b649ec01825c20bd101ec584e559adb287e578
   GOVULNCHECK_VERSION: v1.7.0
   # Fail the build rather than silently fetching a module whose checksum is not
   # in the transparency log.
